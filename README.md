@@ -25,6 +25,7 @@
 - [21. 仅 loopback 的 gRPC 服务与网关反代的意义及实现](#21-仅-loopback-的-grpc-服务与网关反代的意义及实现)
 - [22. 前端调用 gRPC 服务还是 HTTP 网关？两者有何区别？](#22-前端调用-grpc-服务还是-http-网关两者有何区别)
 - [23. grpc-gateway 路由注册机制与双端口架构](#23-grpc-gateway-路由注册机制与双端口架构)
+- [24. 契约与部署拓扑解耦与资源导向的 API 路径设计](#24-契约与部署拓扑解耦与资源导向的-api-路径设计)
 
 ---
 
@@ -4879,4 +4880,117 @@ flowchart TB
 > 两个端口对应两层壳，里面共享同一个 service 单例。
 
 ---
+
+## 24. 契约与部署拓扑解耦与资源导向的 API 路径设计
+
+### 问题
+
+在用 gRPC + grpc-gateway 定义接口时，`.proto` 里的 `option (google.api.http)` 路径到底该怎么写？要不要把产品名（如 `/api/agently`）写进去？动词式的 `/auth/register`、`/switch`、`/chat` 是不是不够规范？企业级做法是怎样的？
+
+### 一、两个核心原则
+
+#### 原则 1：契约与部署拓扑解耦（路径里不写部署前缀）
+
+**`.proto` 契约只描述"业务是什么"，不描述"它被部署在哪个前缀下"。**
+
+- 契约里只写**版本 + 资源**的业务路径，如 `/v1/sessions`、`/v1/sessions/{id}/messages`。
+- **不要**把产品名 / 网关分流前缀（`/api`、`/agently`、`/svc/xxx`）写进注解——这些是**部署拓扑**，应由 nginx / ingress / API 网关在外层统一添加或剥离（strip）。
+- 前端 axios 的 `baseURL` 收口前缀，业务代码只写 `/v1/...`（详见第 19 点的分层实践）。
+
+**为什么要解耦：**
+
+| 若把 `/api/agently` 写进 proto | 解耦后（proto 只写 `/v1/...`） |
+|---|---|
+| 运维想把前缀改成 `/svc/agently` 得改 proto 重新发版 | 改 nginx 一行即可，契约不动 |
+| 契约与某一次部署强绑定，无法复用 | 同一契约可挂在任意前缀 / 任意域名下 |
+| 多环境（内网/公网/多租户）前缀不同就冲突 | 一份契约通吃所有环境 |
+
+> 一句话：**proto 关心"业务身份"，网关关心"挂在哪"，两者互不侵入。**
+
+#### 原则 2：资源导向（Google AIP 风格）
+
+RPC 风格的 `/auth/register`、`/switch` 是"动词满天飞"；Google API 设计指南（AIP）推崇 **资源（名词）+ 标准方法** 的 REST 化风格：
+
+- **名词用复数集合**：`/v1/sessions`、`/v1/agents`、`/v1/tools`。
+- **层级表达从属关系**：`/v1/sessions/{session_id}/messages`。
+- **标准 CRUD 用 HTTP 动词**：`GET`（查）、`POST`（建）、`PATCH/PUT`（改）、`DELETE`（删）。
+- **非 CRUD 的"动作型"接口用自定义方法**：路径里用冒号 `:动词`，如 `:switch`、`:chat`、`:archive`、`:login`。
+- **版本前缀**：路径带 `/v1`，与 proto 的 `package xxx.v1` 对齐，便于将来 `v2` 并存。
+
+### 二、实战改造对照表（以 Agently 为例）
+
+把 RPC 风格重构为"资源导向 + `/v1` + 去产品名前缀"：
+
+| 旧（RPC 风格，含产品名） | 新（资源导向，契约干净） |
+|---|---|
+| `POST /api/agently/auth/send-code` | `POST /v1/auth:sendVerifyCode` |
+| `POST /api/agently/auth/register` | `POST /v1/auth:register` |
+| `POST /api/agently/auth/login` | `POST /v1/auth:login` |
+| `GET /api/agently/agents` | `GET /v1/agents` |
+| `GET /api/agently/tools` | `GET /v1/tools` |
+| `POST /api/agently/switch` | `POST /v1/agents:switch` |
+| `GET/POST /api/agently/sessions` | `GET/POST /v1/sessions` |
+| `GET .../sessions/{id}/messages` | `GET /v1/sessions/{session_id}/messages` |
+| `POST .../sessions/{id}/chat` | `POST /v1/sessions/{session_id}:chat` |
+| `DELETE .../sessions/{id}`（归档） | `POST /v1/sessions/{session_id}:archive` |
+
+> 归档是"软删除/状态变更"而非物理删除，用自定义方法 `:archive`（POST）比 `DELETE` 语义更贴切。
+
+产品名前缀 `/api/agently` 交给 nginx 去前缀反代：外部 `/api/agently/v1/...` → 网关内部 `/v1/...`。
+
+### 三、AIP 命名规则速记
+
+| 场景 | 写法 | 示例 |
+|---|---|---|
+| 查询集合 | `GET /v1/{集合复数}` | `GET /v1/sessions` |
+| 创建资源 | `POST /v1/{集合复数}` | `POST /v1/sessions` |
+| 查询单个 | `GET /v1/{集合}/{id}` | `GET /v1/sessions/{id}` |
+| 子资源 | `GET /v1/{集合}/{id}/{子集合}` | `GET /v1/sessions/{id}/messages` |
+| 删除 | `DELETE /v1/{集合}/{id}` | `DELETE /v1/sessions/{id}` |
+| 自定义动作 | `POST /v1/{集合}/{id}:动词` 或 `POST /v1/{集合}:动词` | `:chat`、`:switch`、`:archive` |
+
+### 四、自定义方法 `:动词` 在 proto / grpc-gateway 中的写法
+
+```proto
+// 带资源 id 的动作
+rpc Chat(ChatRequest) returns (stream ChatEvent) {
+  option (google.api.http) = {
+    post: "/v1/sessions/{session_id}:chat"
+    body: "*"
+  };
+}
+
+// 集合级动作（无 id）
+rpc SwitchAgent(SwitchAgentRequest) returns (SwitchAgentResponse) {
+  option (google.api.http) = {
+    post: "/v1/agents:switch"
+    body: "*"
+  };
+}
+```
+
+- protoc-gen-grpc-gateway 会正确把 `:chat` 解析为"自定义动词"（最后一段 `{session_id}` 之后的 `:动词`）。
+- 若手动 `mux.HandlePath` 注册（如自定义 SSE），pattern 同样写 `"/v1/sessions/{session_id}:chat"`。
+
+### 五、与前端 / nginx 的配合
+
+- **proto 路径不含产品名** → 前端只需把产品前缀收口在 axios `baseURL`（如 `/api/agently`），业务代码只写 `/v1/...`。
+- **nginx 去前缀反代**：`location ^~ /api/agently/ { proxy_pass http://127.0.0.1:8080/; }`（末尾带 `/` 自动 strip 前缀，详见第 18、19 点）。
+- **package 名不影响 REST 路径**：`package xxx.v1` 只决定原生 gRPC 方法路径 `/xxx.v1.Service/Method`（通常仅回环可达，见第 21 点），浏览器走的 REST 路径完全由 `google.api.http` 注解决定，两者互不影响。
+
+### 六、收益
+
+- **契约稳定**：换前缀、换域名、多环境部署都不用改 proto。
+- **语义清晰**：URL 读起来就是"对什么资源做什么"，符合业界共识，第三方对接零学习成本。
+- **版本可演进**：`/v1` 与 `package .v1` 对齐，`v2` 可平滑并存。
+- **前后端一致**：`grep '/v1/sessions'` 前后端都能命中，排查高效。
+
+### 七、记忆口诀
+
+> **契约只写业务路径，版本打头（/v1），前缀别塞。**
+> **名词复数做资源，从属靠层级；CRUD 用 HTTP 动词，动作用 `:动词`。**
+> **产品名交给网关加，package 名只管 gRPC 内部路由。**
+
+---
+
 
