@@ -26,12 +26,12 @@
 - [22. 前端调用 gRPC 服务还是 HTTP 网关？两者有何区别？](#22-前端调用-grpc-服务还是-http-网关两者有何区别)
 - [23. grpc-gateway 路由注册机制与双端口架构](#23-grpc-gateway-路由注册机制与双端口架构)
 - [24. 契约与部署拓扑解耦与资源导向的 API 路径设计](#24-契约与部署拓扑解耦与资源导向的-api-路径设计)
-- [25. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#25-go-编译期接口实现断言var-_-iface--tnil)
+- [25. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#25-Go-编译期接口实现断言var-_-iface--tnil)
+- [26. 查看云服务器运行状态的常用命令速查](#26-查看云服务器运行状态的常用命令速查)
 
 ---
 
 ## 1. Linux 命令行提示符解析
-
 ### 问题
 在 Linux 系统中，输入命令行的前面那一堆 `[xxx@yyy ~]` 的含义是什么？
 
@@ -5127,6 +5127,239 @@ var _ ExtFlowWriter = (*TicketFlowWriter)(nil)
 > **`var _ Iface = (*T)(nil)` 是 Go 里"我承诺 `*T` 实现了 `Iface`"的书面契约，让编译器帮你 24 小时监督这个承诺不被打破。**
 
 这是几乎所有 Go 生产级项目都会用的模式，尤其在**接口和实现分文件/分包**、或**大量依赖注入**的场景下，属于**低成本、高收益**的防御性技巧。
+
+---
+
+## 26. 查看云服务器运行状态的常用命令速查
+
+### 问题
+查看云服务器运行状态有哪些命令？比如查看内存使用情况、网络带宽等数据。
+
+### 解答
+
+Linux 云服务器的运行状态排查可以按 **CPU / 内存 / 磁盘 / 网络 / 进程 / 系统整体** 六大维度来看，每类都有「一句话看全景」和「深入排查」两种命令。下面标注 ⭐ 的是日常最常用的。
+
+---
+
+### 一、系统整体概览
+
+| 命令 | 作用 | 备注 |
+|---|---|---|
+| ⭐ `top` | 实时进程 + CPU + 内存动态视图 | 按 `q` 退出，按 `M` 按内存排序，`P` 按 CPU 排序 |
+| ⭐ `htop` | `top` 的彩色增强版，可鼠标操作 | 需要 `yum/apt install htop`，强烈推荐 |
+| ⭐ `uptime` | 一行看负载：运行时长 + 1/5/15 分钟 load average | load 超过 CPU 核数就要警惕 |
+| `w` | 当前登录用户 + load + 每个用户在干啥 | 类似 uptime，多了用户信息 |
+| `dstat -tcmndl 2` | CPU/内存/网络/磁盘/负载 **一屏看全** | 需装 `dstat`，运维排查神器 |
+| `glances` | Python 写的全能监控面板 | 一屏看 CPU/内存/磁盘/网络/进程 |
+
+**Load average 怎么看？**
+
+```
+load average: 0.85, 1.20, 1.55
+```
+
+三个数分别是 **过去 1 / 5 / 15 分钟的平均运行/等待进程数**。经验法则：数值 ≤ CPU 核数视为健康；持续高于核数 × 1.5 说明系统在排队。
+
+---
+
+### 二、CPU 使用情况
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `top` 后按 `1` | 展开显示每个 CPU 核的使用率 |
+| ⭐ `mpstat -P ALL 2` | 每 2 秒刷新每个 CPU 核的详细占用（`%usr`/`%sys`/`%iowait`/`%idle`） |
+| `vmstat 2` | 2 秒刷新一次：进程队列、内存、swap、IO、CPU 综合 |
+| `pidstat -u 2` | 按进程维度看 CPU 占用 |
+| `nproc` | 一行显示 CPU 逻辑核数 |
+| `lscpu` | CPU 型号、核数、主频、缓存、虚拟化信息 |
+
+**关键指标解读**（`top` 里的 CPU 那行）：
+
+- `us`：用户态占用高 → 应用自身在算
+- `sy`：内核态占用高 → 系统调用/上下文切换多
+- `wa`：**iowait 高 → 磁盘 IO 瓶颈**，不是 CPU 忙
+- `st`：**steal time 高 → 云主机被邻居抢 CPU**（超卖了！云服务器特有指标）
+- `id`：空闲
+
+---
+
+### 三、内存使用情况
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `free -h` | 一行看总量/已用/可用/swap，`-h` 是人类可读单位 |
+| ⭐ `free -h -s 2` | 每 2 秒刷新一次 |
+| `vmstat 2` | 观察 swap 换入换出（`si`/`so`），非 0 就说明内存紧张 |
+| `cat /proc/meminfo` | 内存细节全景（含 Buffers/Cached/Slab/HugePages） |
+| `ps aux --sort=-%mem \| head -20` | 内存占用 Top 20 进程 |
+| `pmap -x <PID>` | 单个进程的内存分布明细 |
+| `smem -tk` | 更准确的 PSS/USS 内存统计（需安装） |
+
+**`free -h` 输出别看错列** ⚠️：
+
+```
+              total   used   free   shared  buff/cache   available
+Mem:           16G    8.2G   1.1G     0.5G       6.7G        7.2G
+```
+
+- **`available` 才是应用可申请的真实可用内存**（≠ free）
+- `buff/cache` 是文件系统缓存，紧张时会自动释放，**不算真的被占用**
+- 判断内存是否紧张：看 `available` 占比，以及 `swap used` 是否在增长
+
+---
+
+### 四、磁盘使用情况
+
+#### 4.1 空间维度
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `df -h` | 各文件系统的容量/已用/可用/挂载点 |
+| ⭐ `df -i` | 查看 **inode 使用率**（inode 满了也会写不进去，容易忽视！） |
+| ⭐ `du -sh *` | 当前目录下每项占用大小 |
+| `du -h --max-depth=1 / \| sort -h` | 逐层找出大目录（找磁盘吃谁了） |
+| `ncdu /` | 交互式磁盘占用分析（强烈推荐，需 `apt install ncdu`） |
+| `lsblk` | 块设备树（哪些盘、分区、挂载点） |
+
+#### 4.2 IO 性能维度
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `iostat -x 2` | 每 2 秒刷新磁盘 IO：吞吐、IOPS、await、%util |
+| ⭐ `iotop` | 按进程看谁在读写磁盘（需 root） |
+| `pidstat -d 2` | 按进程维度的 IO 统计 |
+
+**iostat 关键列**：
+
+- `%util`：**接近 100% → 磁盘打满**
+- `await`：单次 IO 平均耗时（ms），机械盘 > 20ms、SSD > 5ms 都算慢
+- `r/s`、`w/s`：每秒读写次数（IOPS）
+
+---
+
+### 五、网络使用情况
+
+#### 5.1 连通性 & 配置
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `ip a` / `ifconfig` | 网卡列表和 IP 地址 |
+| ⭐ `ip r` / `route -n` | 路由表 |
+| `ping <host>` | 连通性 + 延迟 |
+| `traceroute <host>` / `mtr <host>` | 逐跳看链路，`mtr` 是持续统计版，排查网络故障首选 |
+| `curl -w "@format" -o /dev/null -s <url>` | 精细化测量 DNS/TCP/TLS/首字节各阶段耗时 |
+
+#### 5.2 带宽 & 流量 ⭐
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `iftop -i eth0` | 实时看**每个连接**的带宽占用（需 root，最常用） |
+| ⭐ `nload eth0` | 简洁的入/出带宽实时图 |
+| ⭐ `sar -n DEV 2` | 按网卡统计收发速率（`rxkB/s`、`txkB/s`） |
+| `vnstat -l` | 实时流量；`vnstat -d` 看每日累计（做流量账单必备） |
+| `bmon` | 多网卡带宽仪表盘 |
+| `iptraf-ng` | 按协议/端口/连接维度的老牌工具 |
+
+#### 5.3 连接 & 端口
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `ss -tnlp` | 看**监听中**的 TCP 端口和对应进程（比 netstat 快很多） |
+| ⭐ `ss -tan` | 看所有 TCP 连接状态 |
+| ⭐ `ss -s` | 连接总数摘要（各种状态数量） |
+| `ss -tan \| awk '{print $1}' \| sort \| uniq -c` | 快速统计各状态连接数（`ESTAB`/`TIME-WAIT`/`CLOSE-WAIT` 等） |
+| `netstat -tnlp` | 传统写法，新系统建议用 `ss` |
+| `lsof -i:8080` | 谁在监听 8080 端口 |
+
+**排查连接异常时重点看**：
+
+- `TIME_WAIT` 过多 → 短连接太多，考虑复用
+- `CLOSE_WAIT` 过多 → **应用层没正确关闭连接**（代码 bug 信号）
+- `SYN_RECV` 过多 → 可能被 SYN Flood 攻击
+
+#### 5.4 抓包
+
+| 命令 | 作用 |
+|---|---|
+| `tcpdump -i eth0 -nn port 80` | 抓 80 端口流量 |
+| `tcpdump -i eth0 -w cap.pcap` | 抓包存文件，回本地用 Wireshark 分析 |
+
+---
+
+### 六、进程排查
+
+| 命令 | 作用 |
+|---|---|
+| ⭐ `ps aux` / `ps -ef` | 所有进程快照 |
+| ⭐ `ps aux --sort=-%cpu \| head` | CPU Top N |
+| ⭐ `ps aux --sort=-%mem \| head` | 内存 Top N |
+| `pgrep -af nginx` | 按名字找 PID |
+| `pstree -p` | 进程树 |
+| `lsof -p <PID>` | 进程打开的所有文件/端口/连接 |
+| `strace -p <PID>` | 系统调用跟踪（在线诊断卡死） |
+
+---
+
+### 七、日志 & 内核事件
+
+| 命令 | 作用 |
+|---|---|
+| `dmesg -T \| tail -50` | 内核日志（OOM、硬盘错误、网卡 down 都在这） |
+| `journalctl -xe` | systemd 全局日志 |
+| `journalctl -u nginx -f` | 跟踪某个服务的日志 |
+| `tail -f /var/log/messages` | 老系统的系统日志 |
+| `grep -i "out of memory" /var/log/messages` | 排查 OOM Killer 记录 |
+
+---
+
+### 八、日常巡检「一键三连」推荐流程 🚀
+
+排查一台可疑的云主机，建议按这个顺序敲：
+
+```bash
+# 1. 30 秒看全景
+uptime && free -h && df -h
+
+# 2. 找 CPU 和内存大户
+top       # 按 P 看 CPU，按 M 看内存，按 q 退出
+
+# 3. 磁盘 IO 是否是瓶颈
+iostat -x 2 3
+
+# 4. 网络带宽 & 连接
+sar -n DEV 2 3    # 或 iftop -i eth0
+ss -s
+
+# 5. 有没有系统级异常
+dmesg -T | tail -30
+```
+
+---
+
+### 九、云厂商专有工具补充 ☁️
+
+各家云厂商都提供了 **云监控（Cloud Monitor）** 面板，比命令行更适合看**历史趋势**和**告警**：
+
+| 云厂商 | 监控平台 | Agent 命令 |
+|---|---|---|
+| 腾讯云 | 云监控 CM | `barad-agent`（自动安装） |
+| 阿里云 | 云监控 CloudMonitor | `cloudmonitor` |
+| 华为云 | 云监控 CES | `telescope` |
+| AWS | CloudWatch | `amazon-cloudwatch-agent` |
+
+**命令行 vs 云监控 怎么选？**
+
+- **命令行**：适合**实时**深入排查、看瞬时抖动、抓现场
+- **云监控**：适合看**趋势**、设置阈值告警、跨机聚合；**公网带宽 / 云盘带宽**这些**外部指标**云监控更准，因为它是在宿主机层面统计的
+
+---
+
+### 十、进阶方向
+
+更系统的性能分析方法论推荐 Brendan Gregg 的两张经典图（可搜「Linux Performance Observability Tools」）：
+
+- **USE 方法**：对每个资源看 **U**tilization（使用率）、**S**aturation（饱和度）、**E**rrors（错误）
+- **60 秒诊断清单**：`uptime` → `dmesg` → `vmstat` → `mpstat` → `pidstat` → `iostat` → `free` → `sar -n DEV` → `sar -n TCP,ETCP` → `top`
 
 ---
 
