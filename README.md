@@ -30,6 +30,8 @@
 - [26. 查看云服务器运行状态的常用命令速查](#26-查看云服务器运行状态的常用命令速查)
 - [27. journalctl 单个服务日志过多的清理与重置方法](#27-journalctl-单个服务日志过多的清理与重置方法)
 - [28. 在云服务器上把应用注册为 systemd 系统级服务](#28-在云服务器上把应用注册为-systemd-系统级服务)
+- [29. 为什么生产环境中要用低权限用户跑业务进程](#29-为什么生产环境中要用低权限用户跑业务进程)
+- [30. 云服务器上查看当前有哪些用户](#30-云服务器上查看当前有哪些用户)
 
 ---
 
@@ -5878,6 +5880,342 @@ ReadWritePaths=/opt/mildlab/data /opt/mildlab/logs
 [Install]
 WantedBy=multi-user.target
 ```
+
+---
+
+## 29. 为什么生产环境中要用低权限用户跑业务进程
+
+### 问题
+在 systemd unit 中经常看到「不要用 root 跑业务进程，应该创建专用低权限用户」这类建议。为什么必须这么做？背后的原理是什么？
+
+### 解答
+
+这是一条**运维安全的黄金法则**，本质是**最小权限原则（Principle of Least Privilege, PoLP）**：**任何进程只应拥有完成自身工作所需的最小权限，多一分都不给。**
+
+---
+
+### 一、核心威胁模型：进程权限 = 攻击者拿到的权限 ⭐
+
+安全的第一定律是：**任何面向网络的进程，都要假设它总有一天会被攻破**。
+
+一旦业务进程被攻破（RCE、反序列化漏洞、SQL 注入拿到 shell 等），攻击者就会**继承这个进程的所有权限**。于是问题变成了：**你希望攻击者拿到什么级别的权限？**
+
+| 运行身份 | 被攻破后攻击者能做什么 |
+|---|---|
+| **root** | 🔴 读所有文件（含 `/etc/shadow`）、装后门、加内核模块、改防火墙、擦日志……**整机沦陷** |
+| **专用低权限用户 mildlab** | 🟢 只能读写 `/opt/mildlab/`、只能杀自己的进程，系统文件动不了、其他服务动不了 |
+
+**核心差别**：一个 CVE、一个 Log4Shell、一个反序列化漏洞，若用 root 跑就是**整机沦陷**；若用低权限用户跑，损害被**牢牢限制在业务目录内**。
+
+---
+
+### 二、用 root 跑业务进程的六大具体危害
+
+1. **🔴 读取系统敏感文件**  
+   `/etc/shadow`（密码哈希）、`/root/.ssh/`、所有用户的 `.ssh/id_rsa` 私钥——拖走 shadow 就能离线暴破 root 密码。
+
+2. **🔴 修改系统关键配置**  
+   - 改 `/etc/passwd` 加隐藏账户
+   - 改 `authorized_keys` 植入 SSH 后门
+   - 注册恶意 systemd 服务（开机自启后门）
+   - 改 `iptables`/`firewalld` 开放任意端口
+   - 加载内核 rootkit
+
+3. **🔴 横向感染其他服务**  
+   服务器上每个服务（数据库、缓存、其他业务）的**数据文件、socket、配置**都能被 root 读写。例：MySQL 的 datadir 通常 `mysql:mysql 700`，但 root 无视权限直接搬走 InnoDB 文件——**即使没有密码，所有数据库表都泄露**。
+
+4. **🔴 擦除日志、消除痕迹**  
+   `/var/log/*`、`journalctl --vacuum`、`wtmp`/`btmp`、shell history 都能改，**取证都做不了**。
+
+5. **🔴 挖矿、DDoS、成为跳板**  
+   挖矿占满 CPU、加定时任务复活后门、作为跳板攻击内网、参与 DDoS——**可能带来运营商投诉甚至法律责任**。
+
+6. **🔴 突破容器边界**  
+   在 Docker/K8s 中，容器内 root 通过某些 CVE（如 CVE-2019-5736、CVE-2022-0492）可以**逃逸到宿主机**；非 root 逃逸门槛陡增。
+
+---
+
+### 三、除了安全，还有这些日常好处
+
+#### 1. 🛡️ 防止业务 bug 造成灾难性误操作
+
+```go
+os.RemoveAll(cfg.WorkDir) // 若 WorkDir 因配置错误变成 "/"
+```
+
+- **root 跑**：整机 `rm -rf /`，**服务器 GG**
+- **mildlab 跑**：大部分系统文件无权限删除，**只删自己家里的东西**，损失可控
+
+**低权限用户 = 给失控代码兜底**。
+
+#### 2. 🛡️ 与其他服务隔离
+
+各业务各用各的专用用户，**每个服务只能碰自己的目录**，一个坏掉不牵连其他。
+
+#### 3. 🛡️ 权限即文档
+
+`ls -l /opt/mildlab/` 一眼看出：这个目录属于 mildlab 用户，**排查问题时权限本身就是最好的文档**。
+
+#### 4. 🛡️ 符合审计合规
+
+金融、政企、等保二/三级、ISO27001、SOC2 等审计**明确要求**业务进程不得以特权账户运行。
+
+#### 5. 🛡️ 防止意外「顺手」修改
+
+手一滑 `vim /etc/hosts` 就改了——用 mildlab 跑，想改都改不了，**给危险操作加了确认闸门**。
+
+---
+
+### 四、真实反面教材
+
+#### 案例 1：Redis 未授权 + root 运行 → 服务器沦陷（教科书级）
+
+- Redis 6379 无密码、绑 `0.0.0.0`
+- Redis 以 root 启动
+- 攻击者利用 `CONFIG SET dir /root/.ssh/` + `CONFIG SET dbfilename authorized_keys` + `SET x "ssh-rsa xxx"` + `SAVE`
+- **成功把公钥写入 root 的 authorized_keys → SSH 免密登录整机**
+
+若 Redis 用 `redis` 用户跑，`/root/.ssh/` 根本没写权限，攻击直接失败。
+
+#### 案例 2：Log4Shell（CVE-2021-44228）
+
+大量 Java 服务被 RCE，**用 root 跑 Tomcat/Java 应用**的公司损失惨重；遵循最佳实践用 `tomcat` 专用用户跑的，攻击者只能碰 webapp 目录，为应急响应争取时间。
+
+#### 案例 3：容器逃逸
+
+CVE-2022-0847（Dirty Pipe）允许容器内任意用户改写只读文件——**容器内 root** 可改写宿主机 SUID 二进制实现提权；**容器内非 root** 影响则小得多。
+
+---
+
+### 五、正确做法（结合 systemd 落地）
+
+#### 1. 创建专用系统用户
+
+```bash
+sudo useradd -r -s /sbin/nologin -d /opt/mildlab mildlab
+```
+
+- `-r`：**系统账户**（UID < 1000，不占普通用户段）
+- `-s /sbin/nologin`：**禁止 shell 登录**——即使密钥泄露也无法交互式登录
+- `-d /opt/mildlab`：家目录
+
+#### 2. 严格设置目录权限
+
+```bash
+sudo chown -R mildlab:mildlab /opt/mildlab
+sudo chmod 750 /opt/mildlab              # 拥有者读写执行、同组读执行、其他无权
+sudo chmod 640 /opt/mildlab/config/*.yaml # 配置文件更严格
+```
+
+#### 3. systemd unit 配置
+
+```ini
+[Service]
+User=mildlab
+Group=mildlab
+WorkingDirectory=/opt/mildlab
+ExecStart=/opt/mildlab/bin/mildlab -config /opt/mildlab/config/config.yaml
+```
+
+#### 4. 加一层安全加固
+
+```ini
+NoNewPrivileges=true       # 禁止 setuid 提权
+ProtectSystem=strict       # /usr /boot 只读
+ProtectHome=true           # 隐藏 /home
+PrivateTmp=true            # 独立 /tmp
+ReadWritePaths=/opt/mildlab/data /opt/mildlab/logs  # 白名单可写目录
+```
+
+即使被 RCE，攻击者只能在白名单目录内活动。
+
+---
+
+### 六、看似需要 root 的场景 & 优雅替代方案
+
+#### 场景 1：监听 <1024 端口（80/443）
+
+❌ 用 root 跑整个服务  
+✅ 授予**能力（capability）**：
+
+```ini
+[Service]
+User=mildlab
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+```
+
+或对二进制永久授权：
+
+```bash
+sudo setcap 'cap_net_bind_service=+ep' /opt/mildlab/bin/mildlab
+```
+
+#### 场景 2：读 `/proc/*/io`、发 raw socket
+
+```ini
+AmbientCapabilities=CAP_SYS_PTRACE   # 或 CAP_NET_RAW
+```
+
+单独授能力，而非整个 root。
+
+#### 场景 3：需要操作 systemd
+
+写 D-Bus policy 授权特定接口，而不是给 root。
+
+#### 场景 4：真·必须 root（系统工具/内核模块）
+
+应**短暂持有 root，做完立刻降权**（`setuid()`），并在文档中明确标注、纳入更严格的漏洞跟踪。
+
+---
+
+### 七、一句话总结
+
+> **root 是「上帝权限」，一旦泄露就是整机沦陷；专用低权限用户则把爆炸半径牢牢锁死在业务目录里。**  
+> **在生产环境里，多花两条命令的成本，换来的是「一旦出事，你还能收拾局面」的保命底牌。**
+
+从**安全**（防被攻破后横向扩散）、**稳定**（防 bug 误删）、**隔离**（防服务互相影响）、**合规**（过审计）、**运维**（权限即文档）五个维度看，**「业务进程绝不用 root 跑」应视为一条无条件的生产铁律**。
+
+---
+
+## 30. 云服务器上查看当前有哪些用户
+
+### 问题
+云服务器上查看当前有哪些用户？
+
+### 解答
+
+查看云服务器上的用户主要分两种情况：**当前登录的用户**和**系统里存在的所有用户**。前者看「现在谁在操作机器」，后者看「系统上有哪些账号」（含服务账号）。
+
+---
+
+### 一、👤 查看当前登录到服务器的用户
+
+这些命令告诉你「谁正在操作这台机器」，信息来源主要是 `/var/run/utmp`。
+
+| 命令 | 作用 | 典型输出 |
+|---|---|---|
+| `who` | 显示当前登录的用户名、终端、登录时间、来源 IP | `root pts/0 2026-07-10 10:32 (1.2.3.4)` |
+| `w` | 更详细：用户 + 当前命令 + 系统负载（load average） | 包含 IDLE、JCPU、PCPU、WHAT 列 |
+| `users` | 仅列出当前登录用户名（去重） | `root ubuntu` |
+| `last` | 历史登录记录（来自 `/var/log/wtmp`） | 含登入登出时间与来源 IP |
+| `lastlog` | 每个用户**最后一次**登录时间 | 排查可疑账号时很好用 |
+
+```bash
+who          # 当前登录用户
+w            # 更详细：包含在执行什么命令
+users        # 只看用户名
+last -n 20   # 最近 20 条登录历史
+lastlog      # 所有用户的最后登录记录
+```
+
+> 💡 `who` 和 `w` 看的是 **实时在线**的 session；`last` 看的是历史，可用来审计异常登录。
+
+---
+
+### 二、📋 查看系统里所有用户（账户）
+
+系统账号信息存在 `/etc/passwd`，**包含真人用户和服务/守护进程账号**（如 mysql、nginx、sshd）。
+
+#### 1. 看全部（含字段）
+
+```bash
+cat /etc/passwd
+```
+
+`/etc/passwd` 行格式：`用户名:密码占位(x):UID:GID:描述:家目录:登录shell`。
+
+#### 2. 只列用户名
+
+```bash
+cut -d: -f1 /etc/passwd
+```
+
+#### 3. 只看可登录的普通用户（UID ≥ 1000）
+
+```bash
+awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd
+```
+
+或按 shell 过滤：
+
+```bash
+grep -E ":/bin/bash|:/bin/sh" /etc/passwd | cut -d: -f1
+```
+
+> 💡 UID 约定：`0` = root；`1~999` = 系统/服务账号；`≥1000` = 普通用户（部分发行版为 500）。
+
+---
+
+### 三、🔍 快速查找特定用户是否存在
+
+```bash
+id 用户名              # 有就列出 UID、GID、所属组；无则报 "no such user"
+getent passwd 用户名   # 兼容 LDAP/NIS 等远程账户库
+grep "^用户名:" /etc/passwd
+```
+
+---
+
+### 四、🔐 查看拥有 sudo 权限的用户
+
+```bash
+sudo cat /etc/sudoers            # 主配置
+sudo ls /etc/sudoers.d/          # 分模块配置（推荐放新规则的位置）
+getent group sudo                # Ubuntu/Debian：sudo 组成员
+getent group wheel               # CentOS/RHEL：wheel 组成员
+```
+
+> 💡 修改 sudoers **必须用 `visudo`**，它会语法校验，防止写错导致 sudo 完全不可用。
+
+---
+
+### 五、⚠️ 安全小贴士（异常账号排查思路）
+
+1. **除 root 外 UID=0 的账号 → 高危**（后门典型手法）：
+   ```bash
+   awk -F: '$3==0 {print $1}' /etc/passwd
+   ```
+   正常情况下只应有 `root` 一行。
+
+2. **未知账号且能登录 shell**：
+   ```bash
+   grep -E ":/bin/bash|:/bin/sh" /etc/passwd
+   ```
+
+3. **最近新增账号**：
+   ```bash
+   ls -lt /home/                    # 看家目录创建时间
+   sudo tail -50 /var/log/secure    # RHEL/CentOS 认证日志
+   sudo tail -50 /var/log/auth.log  # Debian/Ubuntu 认证日志
+   ```
+
+4. **异常登录来源 IP**：
+   ```bash
+   last -a | head -30
+   ```
+
+> 💡 看到 `hacker:x:0:0:::/bin/bash` 这种行 → **基本可以确定被入侵**，立即断网保证现场、备份、重装。
+
+---
+
+### 六、一张表快速回忆
+
+| 需求 | 命令 |
+|---|---|
+| 现在谁在登录 | `who` / `w` / `users` |
+| 历史登录 | `last` / `lastlog` |
+| 所有账号 | `cat /etc/passwd` / `cut -d: -f1 /etc/passwd` |
+| 只看真人用户 | `awk -F: '$3>=1000{print $1}' /etc/passwd` |
+| 某个用户存不存在 | `id 名字` / `getent passwd 名字` |
+| 权限大的用户 | `awk -F: '$3==0{print $1}' /etc/passwd` 、`getent group sudo` |
+| sudo 配置 | `sudo cat /etc/sudoers` 、`ls /etc/sudoers.d/` |
+
+---
+
+### 七、一句话总结
+
+> **`/var/run/utmp` 告诉你「谁在在线」，`/etc/passwd` 告诉你「有哪些账号」，`last` 告诉你「过去谁登过」。**  
+> **日常用 `w`、审计用 `last`、排查入侵用 `awk` 扫 `UID=0` 与 `/bin/bash` 行，三招就能看住大部分场景。**
 
 ---
 
