@@ -29,6 +29,7 @@
 - [25. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#25-Go-编译期接口实现断言var-_-iface--tnil)
 - [26. 查看云服务器运行状态的常用命令速查](#26-查看云服务器运行状态的常用命令速查)
 - [27. journalctl 单个服务日志过多的清理与重置方法](#27-journalctl-单个服务日志过多的清理与重置方法)
+- [28. 在云服务器上把应用注册为 systemd 系统级服务](#28-在云服务器上把应用注册为-systemd-系统级服务)
 
 ---
 
@@ -5497,6 +5498,385 @@ sudo sh -c '> /var/log/yourapp.log'
 
 # ❌ 错误：rm 会导致磁盘空间无法立即回收
 sudo rm /var/log/yourapp.log
+```
+
+---
+
+## 28. 在云服务器上把应用注册为 systemd 系统级服务
+
+### 问题
+如何在云服务器上把某个应用注册为系统级服务（以 `mildlab` 为例）？unit 文件各字段含义是什么？如何设置开机自启、启动、重启、关闭？还有什么需要补充的？
+
+### 解答
+
+把应用注册为 systemd 服务后，可以获得：**开机自启、崩溃自动拉起、统一日志接入 journald、标准化启停命令、优雅退出、资源限制、安全隔离**等一整套系统级能力。下面是完整流程。
+
+---
+
+### 一、创建 unit 文件
+
+在 `/etc/systemd/system/` 目录下新建以 `.service` 结尾的文件，文件名就是服务名：
+
+```bash
+sudo vim /etc/systemd/system/mildlab.service
+```
+
+**为什么放在 `/etc/systemd/system/`？** systemd 从多个目录加载 unit，优先级从高到低：
+
+- `/etc/systemd/system/` ← **管理员自定义**（自建服务放这里）
+- `/run/systemd/system/` ← 运行时临时生成
+- `/usr/lib/systemd/system/` ← 软件包安装时自带，**不要手动改**（升级时会被覆盖）
+
+---
+
+### 二、unit 文件各字段详解
+
+典型模板：
+
+```ini
+[Unit]
+Description=MildLab backend service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mildlab
+ExecStart=/opt/mildlab/bin/mildlab -config /opt/mildlab/config/config.yaml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### 2.1 `[Unit]` 段：元信息与启动依赖
+
+| 字段 | 含义 |
+|---|---|
+| `Description=` | 人类可读的服务描述，`systemctl status` 和 `journalctl` 都会显示 |
+| `After=xxx.target` | 启动**顺序**依赖：本服务在 xxx **之后**启动。**只管顺序，不保证 xxx 一定启动** |
+| `Wants=xxx.service` | **弱依赖**：会拉起 xxx，但 xxx 失败不影响本服务 |
+| `Requires=xxx.service` | **强依赖**：xxx 必须成功启动，否则本服务也不起 |
+| `Before=` | 启动顺序：本服务在 xxx 之前启动 |
+| `ConditionPathExists=` | 条件启动，路径不存在则跳过 |
+| `StartLimitIntervalSec=` / `StartLimitBurst=` | 启动限流，防止崩溃时死循环拉起 |
+
+**⚠️ `network.target` vs `network-online.target`（生产易踩坑）**：
+
+- `network.target`：网络栈已加载，但**不保证有 IP、能连通外网**
+- `network-online.target`：网络真正连通（可拨外网、DNS 可解析）
+
+如果服务启动时要连数据库、拉配置中心、访问远程 API，必须用后者：
+
+```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target
+```
+
+#### 2.2 `[Service]` 段：如何启动/停止/重启
+
+**（1）`Type=` 进程类型**（决定 systemd 如何判定「启动成功」）：
+
+| 值 | 含义 | 适用场景 |
+|---|---|---|
+| ⭐ `simple` | ExecStart 启动的进程本身就是主进程，不 fork | 大多数 Go / Python / Node.js 应用 |
+| `exec` | 类似 simple，等 execve() 成功才算就绪 | 更精确的现代应用 |
+| `forking` | 主进程 fork 出子进程后自己退出，systemd 跟踪子进程 | 传统守护进程（老式 nginx、mysqld） |
+| `oneshot` | 跑完一次就退出 | 一次性初始化脚本、备份任务 |
+| `notify` | 进程主动调 `sd_notify()` 通知就绪 | 需要精确就绪信号的服务 |
+
+**（2）`User=` / `Group=` 运行身份**：
+
+- 决定服务以哪个 Linux 用户运行。
+- **不推荐用 root**！被利用就是灾难。生产建议创建专用低权限用户：
+  ```bash
+  sudo useradd -r -s /sbin/nologin -d /opt/mildlab mildlab
+  sudo chown -R mildlab:mildlab /opt/mildlab
+  ```
+- 若必须监听 <1024 端口，可用 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 替代 root。
+
+**（3）`WorkingDirectory=` 工作目录**：
+
+- 相当于启动前 `cd` 到该目录。
+- 影响程序里所有**相对路径**（如 `./config/`、`./logs/`）。
+- **建议永远显式设置**，避免相对路径踩坑。
+
+**（4）`ExecStart=` 启动命令** ⭐（最核心）：
+
+- **必须写绝对路径**（systemd 不解析 `$PATH`）。
+- **不能用 shell 特性**：管道 `|`、重定向 `>`、通配符 `*`、`&&` 都不生效。若必须要用：
+  ```ini
+  ExecStart=/bin/bash -c "cmd1 && cmd2"
+  ```
+- 相关字段：
+  - `ExecStartPre=` / `ExecStartPost=`：启动前/后钩子
+  - `ExecStop=`：自定义停止命令（默认发 SIGTERM）
+  - `ExecReload=`：`systemctl reload` 时执行的命令，如 `ExecReload=/bin/kill -HUP $MAINPID`
+
+**（5）`Restart=` + `RestartSec=` 崩溃自动重启** ⭐：
+
+| `Restart=` 值 | 含义 |
+|---|---|
+| `no`（默认） | 从不重启 |
+| ⭐ `always` | 任何情况退出都重启（含正常退出） |
+| `on-failure` | **仅在异常退出时重启**（多数场景推荐） |
+| `on-abnormal` | 只在被信号杀死/超时时重启 |
+| `unless-stopped` | 除非 `systemctl stop` 手动停止，否则一直重启 |
+
+- `RestartSec=5`：崩溃后等 5 秒再重启，避免死循环打爆 CPU。
+- 推荐搭配启动限流：
+  ```ini
+  [Unit]
+  StartLimitIntervalSec=60
+  StartLimitBurst=5
+  # 60 秒内最多重启 5 次，超了就标记为 failed 不再拉起
+  ```
+
+**（6）`StandardOutput=` / `StandardError=` 日志去向**：
+
+| 值 | 含义 |
+|---|---|
+| ⭐ `journal` | 输出到 journald，用 `journalctl -u xxx` 查看（默认推荐） |
+| `null` | 丢弃 |
+| `file:/path/to/log` | 写到文件（每次启动会**覆盖**） |
+| `append:/path/to/log` | 追加写文件（不覆盖，配合 logrotate 用） |
+| `truncate:/path/to/log` | 启动时截断再写 |
+
+**（7）其他常用字段**：
+
+| 字段 | 用途 |
+|---|---|
+| `Environment="KEY=VALUE"` | 设置环境变量 |
+| `EnvironmentFile=/etc/mildlab/env` | 从文件加载环境变量（改配置不用改 unit） |
+| `LimitNOFILE=65535` | 文件描述符上限（高并发服务必设） |
+| `LimitNPROC=8192` | 进程数上限 |
+| `TimeoutStartSec=30` | 启动超时 |
+| `TimeoutStopSec=30` | 停止超时，超过强杀 |
+| `KillSignal=SIGTERM` | 停止时发送的信号 |
+| `KillMode=mixed` | 主进程收 SIGTERM，子进程收 SIGKILL |
+| `PIDFile=/run/mildlab.pid` | `Type=forking` 时必需 |
+
+**安全加固字段**（生产推荐）：
+
+| 字段 | 作用 |
+|---|---|
+| `NoNewPrivileges=true` | 禁止提权 |
+| `ProtectSystem=strict` | `/usr`、`/boot` 只读 |
+| `ProtectHome=true` | 隐藏 `/home` |
+| `PrivateTmp=true` | 独立 `/tmp` 命名空间 |
+| `ReadWritePaths=/opt/mildlab/data` | 白名单可写目录 |
+
+#### 2.3 `[Install]` 段：启用规则
+
+```ini
+[Install]
+WantedBy=multi-user.target
+```
+
+- **只有存在 `[Install]` 段的 unit 才能被 `systemctl enable`（开机自启）**。
+- `WantedBy=multi-user.target`：当系统进入多用户命令行模式时，把本服务拉起来（云服务器几乎都是这种模式）。
+- `systemctl enable` 的本质就是根据 `WantedBy` 创建软链接：
+  ```
+  /etc/systemd/system/multi-user.target.wants/mildlab.service
+      → /etc/systemd/system/mildlab.service
+  ```
+- 其他常见值：
+  - `graphical.target`：图形界面模式
+  - `default.target`：系统默认目标
+
+---
+
+### 三、开机自启、启动、重启、关闭命令
+
+#### 3.1 修改 unit 后必做的一步 ⭐
+
+```bash
+sudo systemctl daemon-reload   # 让 systemd 重读 unit 配置
+```
+
+> **每次修改 `.service` 文件后都要执行**，否则改动不生效 —— 这是新手最常踩的坑。
+
+#### 3.2 开机自启
+
+```bash
+sudo systemctl enable mildlab            # 只启用自启，不立即启动
+sudo systemctl enable --now mildlab      # ⭐ 启用自启 + 立即启动（一步到位）
+sudo systemctl disable mildlab           # 取消自启
+sudo systemctl disable --now mildlab     # 取消自启 + 立即停止
+```
+
+#### 3.3 启动、停止、重启、重载
+
+```bash
+sudo systemctl start mildlab             # 启动
+sudo systemctl stop mildlab              # 停止
+sudo systemctl restart mildlab           # 重启（先 stop 再 start）
+sudo systemctl reload mildlab            # 重载配置（需程序支持 SIGHUP + unit 有 ExecReload=）
+sudo systemctl reload-or-restart mildlab # 优先 reload，不支持则 restart
+```
+
+#### 3.4 状态与日志
+
+```bash
+sudo systemctl status mildlab            # 状态（含最近若干行日志）
+sudo systemctl is-active mildlab         # active / inactive / failed
+sudo systemctl is-enabled mildlab        # enabled / disabled
+
+journalctl -u mildlab                    # 全部日志
+journalctl -u mildlab -f                 # 实时跟踪
+journalctl -u mildlab -n 100             # 最近 100 行
+journalctl -u mildlab --since "10 min ago"
+journalctl -u mildlab -p err             # 仅 error 以上
+```
+
+#### 3.5 完整上线流程
+
+```bash
+# 1. 编辑 unit 文件
+sudo vim /etc/systemd/system/mildlab.service
+
+# 2. 校验语法（可选）
+sudo systemd-analyze verify /etc/systemd/system/mildlab.service
+
+# 3. 加载配置
+sudo systemctl daemon-reload
+
+# 4. 启用并启动
+sudo systemctl enable --now mildlab
+
+# 5. 检查状态
+sudo systemctl status mildlab
+journalctl -u mildlab -f
+```
+
+---
+
+### 四、生产补充建议 ✨
+
+#### 4.1 专用低权限用户跑业务进程
+
+```bash
+sudo useradd -r -s /sbin/nologin -d /opt/mildlab mildlab
+sudo chown -R mildlab:mildlab /opt/mildlab
+```
+
+对应 unit 改为 `User=mildlab`，即使被攻破也无法影响系统其他部分。
+
+#### 4.2 环境变量从文件加载
+
+```ini
+EnvironmentFile=-/etc/mildlab/mildlab.env
+ExecStart=/opt/mildlab/bin/mildlab -config /opt/mildlab/config/config.yaml
+```
+
+> `-` 前缀表示文件不存在也不报错。改环境变量后 `systemctl restart mildlab` 即可，不用改 unit。
+
+#### 4.3 优雅退出（Go 程序建议）
+
+程序要监听 `SIGTERM`，收到后释放连接、flush 日志、再退出：
+
+```go
+sig := make(chan os.Signal, 1)
+signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+<-sig
+// 优雅关闭逻辑
+```
+
+这样 `systemctl stop` 才能干净地关闭服务，不会丢请求。
+
+#### 4.4 高并发服务提升 ulimit
+
+```ini
+LimitNOFILE=65535
+LimitNPROC=8192
+```
+
+#### 4.5 升级发布流程
+
+```bash
+# 1. 上传新二进制到 /opt/mildlab/bin/mildlab.new
+# 2. 备份旧版本
+sudo mv /opt/mildlab/bin/mildlab /opt/mildlab/bin/mildlab.prev
+# 3. 原子替换
+sudo mv /opt/mildlab/bin/mildlab.new /opt/mildlab/bin/mildlab
+# 4. 重启
+sudo systemctl restart mildlab
+# 5. 验证
+sudo systemctl status mildlab
+journalctl -u mildlab -f
+```
+
+出问题立即回滚：
+
+```bash
+sudo mv /opt/mildlab/bin/mildlab.prev /opt/mildlab/bin/mildlab
+sudo systemctl restart mildlab
+```
+
+#### 4.6 常见排错
+
+| 现象 | 排查方向 |
+|---|---|
+| `systemctl start` 后立刻 failed | `journalctl -u mildlab -n 50` 看具体错误；多为路径错、权限错、端口占用 |
+| `Failed to load environment files` | `EnvironmentFile` 路径写错 |
+| 修改后不生效 | 忘了 `daemon-reload` |
+| 服务反复重启 | 加 `StartLimitBurst` 限流，先解决崩溃根因 |
+| `Permission denied` | 检查 `User` 是否对可执行文件、`WorkingDirectory` 有权限 |
+
+#### 4.7 卸载服务
+
+```bash
+sudo systemctl disable --now mildlab
+sudo rm /etc/systemd/system/mildlab.service
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+```
+
+---
+
+### 五、增强版模板（生产推荐）
+
+综合以上建议，一个更完善的模板如下：
+
+```ini
+[Unit]
+Description=MildLab backend service
+Documentation=https://internal.wiki/mildlab
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=mildlab
+Group=mildlab
+WorkingDirectory=/opt/mildlab
+EnvironmentFile=-/etc/mildlab/mildlab.env
+ExecStart=/opt/mildlab/bin/mildlab -config /opt/mildlab/config/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+LimitNOFILE=65535
+LimitNPROC=8192
+StandardOutput=journal
+StandardError=journal
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mildlab/data /opt/mildlab/logs
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ---
