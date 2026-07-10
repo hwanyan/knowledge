@@ -28,6 +28,7 @@
 - [24. 契约与部署拓扑解耦与资源导向的 API 路径设计](#24-契约与部署拓扑解耦与资源导向的-api-路径设计)
 - [25. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#25-Go-编译期接口实现断言var-_-iface--tnil)
 - [26. 查看云服务器运行状态的常用命令速查](#26-查看云服务器运行状态的常用命令速查)
+- [27. journalctl 单个服务日志过多的清理与重置方法](#27-journalctl-单个服务日志过多的清理与重置方法)
 
 ---
 
@@ -5360,6 +5361,143 @@ dmesg -T | tail -30
 
 - **USE 方法**：对每个资源看 **U**tilization（使用率）、**S**aturation（饱和度）、**E**rrors（错误）
 - **60 秒诊断清单**：`uptime` → `dmesg` → `vmstat` → `mpstat` → `pidstat` → `iostat` → `free` → `sar -n DEV` → `sar -n TCP,ETCP` → `top`
+
+---
+
+## 27. journalctl 单个服务日志过多的清理与重置方法
+
+### 问题
+`journalctl -u [servicename]` 的日志太多了，怎么重置？
+
+### 解答
+
+`journalctl` 本身**没有直接清空单个服务日志的命令**（journald 是集中式日志系统，日志按二进制格式统一存储在 `/var/log/journal/`，无法只删除某个 unit 的记录）。可以通过以下几种方式达到「重置」或「只看最新」的效果。
+
+---
+
+### 方式一：只想「重新开始看」（推荐，无需清空）✅
+
+这是最常见也最安全的做法 —— **不删日志，只是让视图聚焦到最新**。
+
+| 命令 | 作用 |
+|---|---|
+| `journalctl -u 服务名 -f` | 实时追踪，仅显示新日志，不加载历史 |
+| `journalctl -u 服务名 -n 50` | 只看最近 50 行 |
+| `journalctl -u 服务名 --since "1 hour ago"` | 从 1 小时前开始 |
+| `journalctl -u 服务名 --since today` | 从今天 00:00 开始 |
+| `journalctl -u 服务名 --since "2026-07-10 09:00"` | 从指定时间开始 |
+| `journalctl -u 服务名 -p err` | 只看 error 及以上级别 |
+
+**优点**：不会丢失任何历史日志，随时可以回溯排查。
+
+---
+
+### 方式二：确实想「清空」旧日志（全局操作）⚠️
+
+**注意**：`journalctl` 的清理是**系统级**的，会影响**所有服务**的日志，而不是单个服务。执行前请确认不需要保留历史。
+
+```bash
+# 1. 轮转当前日志（把活跃日志文件归档，开启新文件）
+sudo journalctl --rotate
+
+# 2. 按时间清理：只保留最近 1 天
+sudo journalctl --vacuum-time=1d
+
+# 或按大小清理：只保留 100M
+sudo journalctl --vacuum-size=100M
+
+# 或按文件数清理：只保留最新的 5 个归档文件
+sudo journalctl --vacuum-files=5
+```
+
+**执行流程**：先 `--rotate` 关闭当前活跃日志文件（否则活跃文件不会被 vacuum 清理），再 `--vacuum-*` 按条件删除旧的归档文件。
+
+**长期自动化**：可以在 `/etc/systemd/journald.conf` 里配置保留策略，避免手动清理：
+
+```ini
+[Journal]
+SystemMaxUse=500M       # 全部日志最多占 500M
+SystemMaxFileSize=50M   # 单个日志文件最大 50M
+MaxRetentionSec=1week   # 最长保留 1 周
+```
+
+修改后重启 journald 生效：`sudo systemctl restart systemd-journald`。
+
+---
+
+### 方式三：把服务日志独立到文件（长期方案）🔧
+
+如果**只想单独管理某个服务**（真正实现「清空某个服务的日志」），可以修改该服务的 systemd unit 文件，把标准输出重定向到独立文件。
+
+#### 步骤
+
+1. 编辑服务文件，例如 `/etc/systemd/system/yourapp.service`：
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/yourapp
+StandardOutput=append:/var/log/yourapp.log
+StandardError=append:/var/log/yourapp-error.log
+```
+
+> 说明：`file:` 每次启动会**截断**旧文件；`append:` 会**追加**。生产建议用 `append:`，配合 logrotate 做切割。
+
+2. 重载并重启服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart yourapp
+```
+
+3. 之后就可以像普通日志文件一样处理：
+
+```bash
+# 清空日志（保留文件描述符，不影响正在写入的进程）
+sudo truncate -s 0 /var/log/yourapp.log
+
+# 或直接清空
+sudo sh -c '> /var/log/yourapp.log'
+
+# 配合 logrotate 自动切割
+sudo vim /etc/logrotate.d/yourapp
+```
+
+---
+
+### 三种方式对比
+
+| 方式 | 影响范围 | 是否删除历史 | 适用场景 |
+|---|---|---|---|
+| **一、只看最新** | 无 | ❌ 不删 | 日常排查，只想聚焦最新事件 |
+| **二、vacuum 清理** | **全部服务** | ✅ 全删 | 磁盘紧张、系统日志占用过大 |
+| **三、独立到文件** | 单个服务 | ✅ 可单独清空 | 需要长期单独管理某个服务日志 |
+
+---
+
+### 建议 💡
+
+1. **排查问题** → 用 `-f` / `-n` / `--since` 即可，**无需清空**。
+2. **磁盘告急** → 用 `journalctl --vacuum-*` 做全局清理，并在 `journald.conf` 里配置长期保留策略。
+3. **频繁需要独立管理某服务日志** → 采用方式三，把日志重定向到独立文件，再配合 `logrotate` 自动切割。
+
+---
+
+### 补充：`truncate` vs `rm` 清空日志文件的区别
+
+如果采用方式三，**千万别用 `rm` 删日志文件**！因为很多进程启动时就打开了这个文件描述符，`rm` 只是删除目录项，**文件本身仍被进程持有**，磁盘空间不会释放，且新日志还会继续写入这个「已被删除的 inode」，直到进程重启才会真正回收。
+
+正确做法：
+
+```bash
+# ✅ 推荐：truncate 保留文件、清零内容
+sudo truncate -s 0 /var/log/yourapp.log
+
+# ✅ 也可以：用 shell 重定向清空
+sudo sh -c '> /var/log/yourapp.log'
+
+# ❌ 错误：rm 会导致磁盘空间无法立即回收
+sudo rm /var/log/yourapp.log
+```
 
 ---
 
