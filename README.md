@@ -34,6 +34,7 @@
 - [30. 云服务器上查看当前有哪些用户](#30-云服务器上查看当前有哪些用户)
 - [31. 查看与回收指定用户的 sudo 权限](#31-查看与回收指定用户的-sudo-权限)
 - [32. 如何给一个用户赋予 sudo 权限](#32-如何给一个用户赋予-sudo-权限)
+- [33. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）](#33-为什么-psql-在-usr-下而-mysql-在-usrlocal-下fhs-与安装方式)
 
 ---
 
@@ -6669,6 +6670,173 @@ sudo -l -U yan
 
 > **首选 `usermod -aG wheel|sudo <user>` —— 最简单、最主流、最容易回收；需要限定命令时才去写 `/etc/sudoers.d/<user>` —— 内容、命名、回收均以文件为单位，干净可审计。**  
 > **两条铁律：`-aG` 不要忘 `-a`；修改 sudoers 只走 `visudo`。**
+
+---
+
+## 33. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）
+
+### 问题
+为什么在云服务器上，`psql` 被安装在 `/usr/` 目录下，而 `mysql` 被安装在 `/usr/local/` 目录下？
+
+### 解答
+
+**核心结论**：这不是数据库软件本身的差异，而是**你用哪种方式安装了它**：
+
+- `psql` 在 `/usr/bin/` → 通常是**包管理器**（`yum` / `dnf` / `apt`）装的
+- `mysql` 在 `/usr/local/mysql/` → 通常是**官方 tarball / 源码编译**装的
+
+背后的规则来自 UNIX 惯例 **FHS（Filesystem Hierarchy Standard，文件系统层级标准）**。
+
+---
+
+### 一、🧭 FHS 的地盘划分
+
+| 目录 | 谁往里放 | 典型来源 |
+|---|---|---|
+| `/usr/bin/`、`/usr/lib/` | **发行版官方 + 包管理器** | `yum install`、`dnf install`、`apt install` |
+| `/usr/local/bin/`、`/usr/local/lib/` | **管理员本地手动安装** | 官方 tarball、`./configure && make install`、第三方脚本 |
+| `/opt/<vendor>/` | **第三方独立整包**（自成体系） | Oracle、MongoDB Enterprise、部分商业软件 |
+
+> **一句话概括：`/usr/` 是发行版的地盘；`/usr/local/` 是管理员的地盘；`/opt/` 是厂商的地盘。**
+
+这条规矩的目的是——**系统升级/重装时，`/usr/local/` 和 `/opt/` 里的东西不会被包管理器覆盖或删掉**。
+
+---
+
+### 二、🔍 PostgreSQL 为什么在 `/usr/`
+
+CentOS/RHEL：
+
+```bash
+sudo yum install postgresql postgresql-server
+# 或
+sudo dnf install postgresql postgresql-server
+```
+
+Ubuntu/Debian：
+
+```bash
+sudo apt install postgresql postgresql-client
+```
+
+包管理器会严格按 FHS 铺开：
+
+```
+/usr/bin/psql              ← 客户端可执行文件
+/usr/bin/postgres          ← 服务端主程序
+/usr/lib64/pgsql/          ← 动态库
+/usr/share/pgsql/          ← 文档、模板、扩展 SQL 脚本
+/var/lib/pgsql/data/       ← 数据目录（数据不进 /usr）
+/etc/systemd/system/postgresql.service   ← systemd 单元
+```
+
+**特点**：
+
+1. 一条 `yum install` 搞定，依赖自动解决
+2. `yum update` 可以直接升级小版本
+3. 每个文件都在 rpm 数据库里登记，`rpm -qf /usr/bin/psql` 可反查所属包
+4. **数据目录不进 `/usr/`**，而是 `/var/lib/pgsql/`，符合 FHS 里「变化数据放 `/var/`」的规矩
+
+---
+
+### 三、🔍 MySQL 为什么在 `/usr/local/`
+
+MySQL 有多种装法，只有**官方 Generic tarball（`mysql-x.y.z-linux-glibc2.x-x86_64.tar.gz`）**才会默认落在 `/usr/local/`：
+
+```bash
+cd /usr/local
+sudo tar xvf mysql-8.0.xx-linux-glibc2.28-x86_64.tar.xz
+sudo ln -s mysql-8.0.xx-linux-glibc2.28-x86_64 mysql
+```
+
+目录结构：
+
+```
+/usr/local/mysql/                ← MySQL 全部"家当"
+├── bin/mysql, mysqld, mysqldump ← 可执行文件
+├── lib/                          ← 库文件
+├── share/                        ← 字符集、错误信息、SQL 脚本
+├── support-files/                ← 启动模板
+└── data/                         ← ⚠️ 默认数据目录（生产建议改到 /data 或 /var/lib/mysql）
+```
+
+**为什么 MySQL 官方要塞进 `/usr/local/mysql/` 这个自成一体的子目录？**
+
+1. **绿色整包**：所有文件都在一个目录下，删除就是 `rm -rf /usr/local/mysql-xxx`，不留残余
+2. **多版本共存**：可以同时装 `/usr/local/mysql-5.7.x/` 和 `/usr/local/mysql-8.0.x/`，用软链切换
+3. **不与发行版仓库打架**：万一系统仓库里已有一个老版 `mariadb`/`mysql-community`，两者互不覆盖
+4. **升级/回滚简单**：改 `mysql` 这个软链的指向就完成切换
+
+> 如果你用的是 `yum install mysql-community-server`（Oracle 官方 rpm 源），那么 MySQL **也会落在 `/usr/bin/`**，同样遵循 FHS。所以并不是「MySQL 天生就在 /usr/local」，而是**tarball 装法**决定的。
+
+---
+
+### 四、🧾 三大安装方式对比
+
+| 维度 | 包管理器（yum/apt） | 官方 tarball | 源码编译 |
+|---|---|---|---|
+| 典型落点 | `/usr/bin/`、`/usr/lib/` | `/usr/local/<name>/` | `/usr/local/`（默认 `--prefix=/usr/local`） |
+| 依赖解决 | 自动 | 手动 | 手动 |
+| 升级 | `yum update` | 换软链或重装 | 重编译 |
+| 卸载 | `yum remove` 干净 | `rm -rf` 目录 | 需保留 Makefile 或手动清理 |
+| 是否登记到 rpm/dpkg | ✅ | ❌ | ❌ |
+| 多版本共存 | 难 | 容易 | 容易 |
+| 生产可控性 | 一致性好 | 版本可控 | 灵活但成本高 |
+
+**判断你机器上 MySQL/psql 用哪种装的**：
+
+```bash
+# 反查文件属于哪个 rpm 包
+rpm -qf /usr/bin/psql
+# 输出类似 postgresql-13.11-1.el7.x86_64 → 说明是包管理器装的
+
+rpm -qf /usr/local/mysql/bin/mysql
+# 输出 file /usr/local/mysql/bin/mysql is not owned by any package → 说明是 tarball 装的
+```
+
+Debian/Ubuntu 系用 `dpkg -S <path>`。
+
+---
+
+### 五、⚠️ 从这个差异衍生出的运维注意点
+
+1. **`/usr/local/mysql/bin` 默认不在 `$PATH` 里**  
+   ```bash
+   echo 'export PATH=/usr/local/mysql/bin:$PATH' >> /etc/profile.d/mysql.sh
+   ```
+
+2. **systemd 单元不会自动生成**  
+   tarball 装的 MySQL 需要手动写 `/etc/systemd/system/mysqld.service`（呼应第 28 节）。
+
+3. **卸载方式不同**  
+   - `psql`：`sudo yum remove postgresql*`
+   - MySQL tarball：`sudo systemctl stop mysqld && sudo rm -rf /usr/local/mysql*`（**记得先备份数据**）
+
+4. **升级策略不同**  
+   - `psql` 走 `yum update` 小版本，跨大版本要 `pg_upgrade`
+   - MySQL tarball 走「装新版 → 停旧 → 数据目录挂过去 → 起新版」
+
+5. **备份粒度不同**  
+   `/usr/local/mysql/data/` 若和程序放一起，容易在删程序时误删数据 → **生产环境务必把 datadir 移出 `/usr/local/mysql/`**，例如放到 `/data/mysql/`，并 `chown` 给 `mysql` 用户（呼应第 29 节：业务进程要用低权限用户）。
+
+---
+
+### 六、📌 现象速查表
+
+| 现象 | 原因 | 一句话结论 |
+|---|---|---|
+| `psql` 在 `/usr/bin/` | `yum/apt` 装 → 走 FHS | 发行版官方通道 |
+| `mysql` 在 `/usr/local/mysql/` | 官方 tarball 装 → 走 `/usr/local` | 管理员本地整包 |
+| MySQL 也可能在 `/usr/bin/` | 走 Oracle 的 `mysql-community` rpm 源 | 同样是包管理器路径 |
+| PostgreSQL 也可能在 `/usr/pgsql-13/` | 用了 PGDG 多版本 rpm 布局 | 官方多版本变体 |
+
+---
+
+### 七、一句话总结
+
+> **不是数据库软件规定了自己该住哪里，而是「你用哪种方式装」决定了它住哪里：**  
+> **包管理器安装 → `/usr/`（发行版地盘）；tarball / 源码安装 → `/usr/local/`（管理员地盘）；商业整包 → `/opt/`（厂商地盘）。**  
+> **`psql` 是被 `yum` 请进 `/usr/`，`mysql` 是被 tarball 铺进 `/usr/local/`，仅此而已。**
 
 ---
 
