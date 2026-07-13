@@ -35,6 +35,8 @@
 - [31. 查看与回收指定用户的 sudo 权限](#31-查看与回收指定用户的-sudo-权限)
 - [32. 如何给一个用户赋予 sudo 权限](#32-如何给一个用户赋予-sudo-权限)
 - [33. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）](#33-为什么-psql-在-usr-下而-mysql-在-usrlocal-下fhs-与安装方式)
+- [34. 查看云服务器存储空间使用情况的运维命令速查](#34-查看云服务器存储空间使用情况的运维命令速查)
+- [35. 查看云服务器内存使用情况的运维命令速查](#35-查看云服务器内存使用情况的运维命令速查)
 
 ---
 
@@ -6837,6 +6839,657 @@ Debian/Ubuntu 系用 `dpkg -S <path>`。
 > **不是数据库软件规定了自己该住哪里，而是「你用哪种方式装」决定了它住哪里：**  
 > **包管理器安装 → `/usr/`（发行版地盘）；tarball / 源码安装 → `/usr/local/`（管理员地盘）；商业整包 → `/opt/`（厂商地盘）。**  
 > **`psql` 是被 `yum` 请进 `/usr/`，`mysql` 是被 tarball 铺进 `/usr/local/`，仅此而已。**
+
+---
+
+## 34. 查看云服务器存储空间使用情况的运维命令速查
+
+### 问题
+如何查看云服务器的存储空间使用情况？包括：整体磁盘/分区使用情况、指定目录的占用、查找大文件与大目录等常用运维命令有哪些？
+
+### 解答
+
+磁盘空间排查是最高频的运维动作之一：磁盘写满会导致数据库写失败、日志无法落盘、systemd 服务异常退出、Nginx 502 等各种连锁故障。要点是**先看整体，再看目录，最后定位到具体文件**，形成 `df → du → find/ncdu` 的三级排查路径。
+
+---
+
+### 一、🧱 先厘清几个基础概念
+
+| 概念 | 含义 | 常用命令 |
+|---|---|---|
+| **块设备（block device）** | 物理/云盘设备，如 `/dev/vda`、`/dev/nvme0n1` | `lsblk`、`fdisk -l` |
+| **文件系统（filesystem）** | 挂载在某个目录上的分区，如 `ext4`、`xfs` | `df -hT` |
+| **inode** | 文件元数据槽位，小文件极多时可能耗尽 | `df -i` |
+| **挂载点（mount point）** | 分区映射到的目录路径，如 `/`、`/data` | `mount`、`findmnt` |
+| **du vs df 的差别** | `df` 看的是文件系统层（块级视角），`du` 看的是目录树层（文件级视角） | 二者结果不一致时通常是「已删除但仍被进程持有的文件」 |
+
+> ⚠️ 常见坑：`df` 显示磁盘满，但 `du /` 求和却对不上——大概率是**有进程仍持有已删除文件的句柄**，见下文「四、疑难场景」。
+
+---
+
+### 二、📊 整体使用情况：`df` 家族
+
+#### 1）最常用的一条：查看所有已挂载文件系统
+
+```bash
+df -h                       # -h：human readable（1K→1.0K、1M、1G）
+```
+
+输出关键列：
+- `Filesystem`：底层设备/挂载源
+- `Size` / `Used` / `Avail`：总量 / 已用 / 可用
+- `Use%`：使用率（**≥85% 就要开始警惕**）
+- `Mounted on`：挂载点
+
+#### 2）同时看文件系统类型（排除 tmpfs 等虚拟盘）
+
+```bash
+df -hT                      # -T：显示 filesystem type
+df -hT -x tmpfs -x devtmpfs # 排除掉内存类虚拟挂载，聚焦真实磁盘
+```
+
+#### 3）看 inode 使用情况（小文件海量场景必查）
+
+```bash
+df -ih                      # -i：inode 视角；-h：可读单位
+```
+
+> 如果 `IUse%` 已经 100%，即使 `Use%` 还有富余，也**照样无法创建新文件**（常见于 mail 队列、session 文件、K8s emptyDir 里的小碎文件）。
+
+#### 4）看某个具体目录属于哪个分区、还剩多少
+
+```bash
+df -h /var/lib/mysql        # 精确查询该路径挂载的那块盘
+df -h .                     # 当前目录所在分区
+```
+
+#### 5）查看块设备与分区结构（df 之前的一步）
+
+```bash
+lsblk                       # 树形展示所有块设备与挂载点
+lsblk -f                    # 附带 filesystem/UUID/LABEL
+sudo fdisk -l               # 更底层的分区表信息（需 root）
+sudo parted -l              # GPT 分区场景推荐
+```
+
+---
+
+### 三、📁 指定目录的使用情况：`du` 家族
+
+`du`（disk usage）沿目录树递归求和，适合回答「**这个目录到底占了多少**」。
+
+#### 1）看某个目录的总占用
+
+```bash
+du -sh /var/log             # -s：summary 只汇总；-h：可读单位
+```
+
+#### 2）看某目录**下**每个一级子目录/文件的占用（最常用于定位大户）
+
+```bash
+du -h --max-depth=1 /var    # 只看 /var 下一级
+du -h -d 1 /var             # 同上，-d 是 --max-depth 的简写
+du -h -d 1 /var 2>/dev/null # 屏蔽 Permission denied 噪音
+```
+
+#### 3）**按大小排序**，从大到小找出大目录（运维排查黄金命令）
+
+```bash
+du -h -d 1 /var 2>/dev/null | sort -hr | head -n 20
+```
+
+- `sort -h`：按 human-readable 大小排序（1K < 1M < 1G）
+- `-r`：倒序（大 → 小）
+- `head -n 20`：只看前 20 名
+
+#### 4）从根目录逐层往下"钻取"大目录（推荐工作流）
+
+```bash
+# 第一层：从根看谁最大
+du -h -d 1 / 2>/dev/null | sort -hr | head
+
+# 假设 /var 最大，进第二层
+du -h -d 1 /var 2>/dev/null | sort -hr | head
+
+# 假设 /var/log 最大，再深一层
+du -h -d 1 /var/log 2>/dev/null | sort -hr | head
+```
+
+#### 5）排除某些目录（避免误统计挂载盘 / 网络盘）
+
+```bash
+du -h -d 1 / --exclude=/proc --exclude=/sys --exclude=/mnt 2>/dev/null | sort -hr
+```
+
+#### 6）交互式神器：`ncdu`（强烈推荐日常使用）
+
+```bash
+sudo yum install -y ncdu    # CentOS/RHEL
+sudo apt install -y ncdu    # Debian/Ubuntu
+
+ncdu /                      # 扫描后可上下键浏览、d 键删除
+ncdu -x /                   # -x：不跨文件系统，避免扫到 /proc、/mnt
+```
+
+> `ncdu` 相当于**终端版的 WinDirStat / DaisyDisk**，是排查磁盘问题的效率工具。
+
+---
+
+### 四、🔍 查找大文件与异常文件
+
+#### 1）按大小查找大文件（find + -size）
+
+```bash
+# 查找 /var 下大于 100M 的文件
+sudo find /var -type f -size +100M -exec ls -lh {} \; 2>/dev/null
+
+# 大于 1G 的文件
+sudo find / -xdev -type f -size +1G -exec ls -lh {} \; 2>/dev/null
+```
+
+- `-xdev`：**不跨文件系统**，防止扫到 `/proc`、`/sys`、`/mnt` 等
+- `-size +100M`：大于 100M；`+1G`、`+500k` 类似
+- `-exec ls -lh {} \;`：把匹配到的文件用 `ls -lh` 打印，包含大小与权限
+
+#### 2）Top N 大文件排行榜（find + sort，实战最常用）
+
+```bash
+sudo find /var -xdev -type f -printf '%s %p\n' 2>/dev/null \
+  | sort -nr | head -n 20 \
+  | awk '{ printf "%.1f MB\t%s\n", $1/1024/1024, $2 }'
+```
+
+- `-printf '%s %p\n'`：字节数 + 路径，比 `ls -l` 快得多
+- `sort -nr | head`：取最大 20 个
+- `awk`：把字节转成 MB 并美化输出
+
+#### 3）按修改时间查（清理老旧日志）
+
+```bash
+# 30 天前修改过的、大于 100M 的日志文件
+sudo find /var/log -type f -mtime +30 -size +100M -exec ls -lh {} \; 2>/dev/null
+```
+
+#### 4）已删除但仍被进程占用的"幽灵文件"（df 满、du 却对不上时必查）
+
+```bash
+sudo lsof +L1               # +L1 = link count < 1，即已 unlink 但仍被打开
+# 或
+sudo lsof | grep deleted
+```
+
+处理方式：**重启持有该 fd 的进程**（例如 `systemctl restart nginx`），或对该进程做 `truncate` / `> /proc/<pid>/fd/<n>`。
+
+> 典型场景：Nginx / 应用把日志文件 `rm` 掉了，但进程没有重新 `open`，文件句柄还在，磁盘就一直不释放。
+
+#### 5）按 inode 查找小文件极多的目录
+
+```bash
+# 找出 /var 下文件数最多的一级子目录
+for d in /var/*; do
+  [ -d "$d" ] && echo "$(sudo find "$d" 2>/dev/null | wc -l) $d"
+done | sort -nr | head
+```
+
+---
+
+### 五、🧪 云环境的额外命令
+
+#### 1）云盘/挂载盘识别
+
+```bash
+lsblk                       # 看是否有未挂载的数据盘
+sudo blkid                  # 看每块盘的 UUID 与 filesystem
+cat /etc/fstab              # 看开机自动挂载表
+findmnt                     # 树状看当前挂载
+```
+
+#### 2）扩容后让分区/文件系统"看见"新空间（云厂商在线扩盘后必做）
+
+```bash
+# 假设扩了 /dev/vda1
+sudo growpart /dev/vda 1    # 扩分区
+sudo xfs_growfs /            # xfs 文件系统扩容
+sudo resize2fs /dev/vda1    # ext4 文件系统扩容
+```
+
+#### 3）实时观察磁盘 IO（是不是被写爆了）
+
+```bash
+iostat -xz 1                # 需要 sysstat 包
+sudo iotop -oPa             # 按进程看 IO（-o 只看活跃，-P 按进程，-a 累计）
+```
+
+---
+
+### 六、🧯 一套「磁盘写满」应急排查 SOP
+
+按顺序照抄即可 ⬇️
+
+```bash
+# 1. 看整体：哪个分区满了？
+df -hT
+df -ih                                    # 顺手看下 inode
+
+# 2. 定位大目录：从根往下钻
+du -h -d 1 / 2>/dev/null | sort -hr | head
+# 假设发现 /var 最大：
+du -h -d 1 /var 2>/dev/null | sort -hr | head
+du -h -d 1 /var/log 2>/dev/null | sort -hr | head
+
+# 3. 找大文件 Top 20
+sudo find / -xdev -type f -printf '%s %p\n' 2>/dev/null \
+  | sort -nr | head -n 20 \
+  | awk '{ printf "%.1f MB\t%s\n", $1/1024/1024, $2 }'
+
+# 4. 如果 df 满但 du 对不上，找幽灵文件
+sudo lsof +L1
+
+# 5. 清理常见"重灾区"
+sudo journalctl --vacuum-time=7d          # 清 journal 日志（呼应第 27 节）
+sudo journalctl --vacuum-size=500M
+sudo yum clean all                         # 清包管理器缓存
+sudo apt clean                             # Debian/Ubuntu
+find /tmp -type f -atime +7 -delete        # 清 7 天以上的 /tmp
+docker system prune -af --volumes          # 清 Docker（谨慎，会删无用镜像/卷）
+
+# 6. 清理后复核
+df -h
+```
+
+---
+
+### 七、📌 命令速查表（背下来这一张就够用）
+
+| 需求 | 命令 |
+|---|---|
+| 看所有分区使用率 | `df -h` |
+| 看分区类型 + 使用率 | `df -hT` |
+| 看 inode 使用率 | `df -ih` |
+| 看某目录所在分区 | `df -h /path` |
+| 看目录总占用 | `du -sh /path` |
+| 看目录下一级子项占用（排序） | `du -h -d 1 /path 2>/dev/null \| sort -hr \| head` |
+| 交互式浏览磁盘占用 | `ncdu -x /path` |
+| 找大于 1G 的大文件 | `sudo find / -xdev -type f -size +1G -exec ls -lh {} \; 2>/dev/null` |
+| Top 20 大文件排行 | `sudo find /path -xdev -type f -printf '%s %p\n' \| sort -nr \| head -20` |
+| 找幽灵文件（df 满 du 不对） | `sudo lsof +L1` |
+| 看块设备/挂载 | `lsblk -f` |
+| 实时看磁盘 IO | `iostat -xz 1`、`sudo iotop -oPa` |
+| 扩容后同步分区 | `growpart` + `xfs_growfs` / `resize2fs` |
+
+---
+
+### 八、⚠️ 常见坑与经验
+
+1. **`du /` 不加 `--exclude=/proc` 会看到奇怪的大小或权限报错**——始终配 `2>/dev/null`。
+2. **`df` 用的是「已分配块」，`du` 用的是「文件实际引用」**：稀疏文件（sparse file，如虚拟机镜像、数据库预分配文件）会让二者差异巨大。
+3. **`-xdev` 很重要**——不加会跨挂载点跑到 `/proc`、`/sys`、`/mnt/nfs` 上，既慢又误导结论。
+4. **删除大日志文件后空间不释放**：一定要**重启或让进程重开日志**，否则 `lsof +L1` 里那一堆 `(deleted)` 永远赖着不走（呼应第 27 节 journalctl 清理）。
+5. **别对 `/` 直接 `du -h /`（不加 `-d`）**——递归遍历整棵树非常慢，且屏幕会被刷爆；用 `--max-depth=1` 逐层钻取才是正确姿势。
+6. **生产环境慎用 `find / -delete`**——建议先 `-print` 或 `-exec ls` 预览，确认无误后再删。
+7. **inode 满和空间满是两回事**——某些场景（如 mail queue、大量 session 小文件）会先耗尽 inode，此时 `df -h` 依然显示有空间，但已无法写入。
+
+---
+
+### 九、一句话总结
+
+> **`df` 看整体，`du` 看目录，`find` / `ncdu` 定位文件；`-xdev` 防跑偏，`2>/dev/null` 去噪音，`sort -hr | head` 抓大户；`df` 满 `du` 对不上就查 `lsof +L1` 的幽灵文件。**  
+> **一条排查主线：`df -h → du -h -d 1 逐层下钻 → find/ncdu 定位具体文件 → 清理或重启持有 fd 的进程 → 复核 `df -h`。**
+
+---
+
+## 35. 查看云服务器内存使用情况的运维命令速查
+
+### 问题
+如何查看云服务器的内存（运行内存 RAM）使用情况？包括：整体内存/交换分区使用情况、按进程查看内存占用、排查内存泄漏、OOM 事件复盘等常用运维命令有哪些？
+
+### 解答
+
+内存问题和磁盘问题（呼应第 34 节）是运维排查的两大高频场景。内存耗尽会导致：**进程被 OOM Killer 杀掉、系统 swap 抖动、响应变慢、服务不可用**。要点是**先看整体，再看进程，最后复盘 OOM 事件**，形成 `free → top/ps → dmesg/journalctl` 的三级排查路径。
+
+---
+
+### 一、🧠 先厘清 Linux 内存的几个关键概念
+
+| 概念 | 含义 | 备注 |
+|---|---|---|
+| **total** | 物理内存总量 | 由硬件决定，云主机由套餐规格决定 |
+| **used** | 已被应用/内核使用的内存 | 不含 buff/cache |
+| **free** | 完全未使用的内存 | ⚠️ **不是可用内存**，只是「一点没碰过」的 |
+| **buff/cache** | 内核用于加速 IO 的缓冲/缓存 | **可随时回收**，本质上算「可用」 |
+| **available** | 真正可用的内存（近似值） | = free + 可回收的 buff/cache，**这才是你该看的指标** |
+| **swap** | 交换分区 / 交换文件 | 内存不够时把冷数据换到磁盘，抖动会导致性能雪崩 |
+| **RSS** | 进程常驻物理内存（Resident Set Size） | 进程真正占用的物理页 |
+| **VSZ / VIRT** | 进程虚拟内存大小 | **包括未真正分配的地址空间，看着大不代表真占用** |
+| **SHR** | 进程使用的共享内存 | 多进程共用（如 libc、mmap 文件） |
+| **OOM Killer** | 内核在内存耗尽时挑选进程强杀的机制 | 由 `oom_score` 排序，可通过 `oom_score_adj` 干预 |
+
+> ⚠️ 最常见误区：看 `free` 列吓一跳「内存怎么快满了」——其实应该看 **`available`**。Linux 的设计哲学是：**空闲的内存是浪费，能用就用来做 cache，需要时再让出来**。
+
+---
+
+### 二、📊 整体内存使用情况：`free` 家族
+
+#### 1）最常用的一条：`free -h`
+
+```bash
+free -h                     # -h：human readable（Mi、Gi）
+```
+
+输出示例：
+
+```
+              total        used        free      shared  buff/cache   available
+Mem:          7.6Gi       2.1Gi       350Mi       120Mi       5.1Gi       5.0Gi
+Swap:         2.0Gi       128Mi       1.9Gi
+```
+
+关键判断：
+- **看 `available` 而不是 `free`**：上例中真正可用是 `5.0Gi`，而不是 `350Mi`。
+- **`Swap.used > 0` 且持续增长** = 物理内存吃紧，开始换页，是**性能拐点前的预警**。
+
+#### 2）显示总计行 + 更多单位
+
+```bash
+free -h -t                  # -t：追加 total 汇总行（Mem+Swap）
+free -m                     # 以 MB 为单位
+free -g                     # 以 GB 为单位（会有精度损失）
+free -w                     # -w：分开显示 buffers 和 cache（不合并）
+```
+
+#### 3）持续监控（每 2 秒刷新一次）
+
+```bash
+free -h -s 2                # -s N：每 N 秒刷一次
+watch -n 1 free -h          # 用 watch 包一层，界面更清爽
+```
+
+#### 4）从原始数据看：`/proc/meminfo`
+
+```bash
+cat /proc/meminfo | head -20
+```
+
+重点字段：
+- `MemTotal` / `MemFree` / `MemAvailable`：对应 `free` 的三列
+- `Buffers` / `Cached` / `SReclaimable`：可回收部分
+- `Dirty`：待写回磁盘的脏页（**过大意味着 IO 压力**）
+- `SwapTotal` / `SwapFree`
+- `Slab` / `SReclaimable` / `SUnreclaim`：内核对象缓存（**内核内存泄漏时会异常增长**）
+
+---
+
+### 三、🔬 按进程查看内存占用：`top` / `ps` / `pmap`
+
+#### 1）交互式：`top` / `htop`
+
+```bash
+top                         # 按 M 键：按内存降序排序
+top -o %MEM                 # 直接以内存占比排序启动（新版 top）
+
+# 更好用的替代品（推荐安装）
+sudo yum install -y htop    # CentOS / RHEL
+sudo apt install -y htop    # Debian / Ubuntu
+htop                        # F6 排序、F9 kill、F3 搜索，可视化极佳
+```
+
+`top` 中关注的列：
+- `%MEM`：进程占物理内存的百分比
+- `RES` / `RSS`：常驻物理内存（**真正吃了多少内存看这里**）
+- `VIRT` / `VSZ`：虚拟内存（包含未真正分配的地址空间，会虚高）
+- `SHR`：共享内存
+
+#### 2）非交互式：`ps` 按内存排序（脚本 / 一次性查询）
+
+```bash
+# Top 20 内存占用进程
+ps aux --sort=-%mem | head -n 21
+
+# 只看关键列（更清爽）
+ps -eo pid,ppid,user,rss,vsz,%mem,%cpu,cmd --sort=-rss | head -n 21
+
+# 按 RSS 求和（更贴近真实占用）
+ps -eo rss,cmd --sort=-rss | head -n 10 | awk '{ printf "%.1f MB\t%s\n", $1/1024, substr($0, index($0,$2)) }'
+```
+
+#### 3）看单个进程的详细内存映射：`pmap`
+
+```bash
+pmap -x <PID>               # -x：扩展输出，显示 RSS、Dirty 等
+pmap -x <PID> | tail -1     # 只看汇总行
+```
+
+典型输出（末尾一行是总计）：
+
+```
+total kB          2145280    485632    198740
+```
+
+对应：**VSZ / RSS / Dirty**。想知道「这个进程到底吃了多少物理内存」——**看 RSS 那列**。
+
+#### 4）进程状态文件：`/proc/<PID>/status`
+
+```bash
+grep -E 'Vm|Rss' /proc/<PID>/status
+```
+
+关键字段：
+- `VmRSS`：常驻物理内存
+- `VmSize`：虚拟内存
+- `VmSwap`：**该进程已被换出到 swap 的大小**（排查 swap 抖动神器）
+- `VmPeak` / `VmHWM`：进程历史峰值
+
+---
+
+### 四、💾 交换分区（Swap）相关
+
+#### 1）查看 swap 使用情况
+
+```bash
+swapon --show               # 显示 swap 设备/文件、大小、已用量、优先级
+cat /proc/swaps             # 同上的原始数据
+free -h                     # 里面的 Swap 行
+```
+
+#### 2）看哪个进程用 swap 用得最多（内存泄漏 / OOM 前兆排查）
+
+```bash
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+  swap=$(awk '/VmSwap/ {print $2}' /proc/$pid/status 2>/dev/null)
+  if [ -n "$swap" ] && [ "$swap" -gt 0 ]; then
+    cmd=$(cat /proc/$pid/comm 2>/dev/null)
+    echo "$swap KB  PID=$pid  $cmd"
+  fi
+done | sort -nr | head -n 20
+```
+
+#### 3）临时清理 swap（业务低峰期慎用）
+
+```bash
+sudo swapoff -a && sudo swapon -a
+```
+
+> ⚠️ 会把 swap 里的数据全部换回内存，物理内存必须够，否则会 OOM。
+
+#### 4）调整 swappiness（内核倾向使用 swap 的程度，0~100）
+
+```bash
+cat /proc/sys/vm/swappiness           # 查看当前值（默认 60）
+sudo sysctl vm.swappiness=10          # 临时改（重启失效）
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf   # 永久（呼应第 7 节 sudo tee）
+sudo sysctl -p
+```
+
+> 数据库/内存敏感型服务通常建议调到 `1~10`，让内核**尽量不换出**。
+
+---
+
+### 五、💥 OOM 事件复盘（进程被莫名其妙杀掉时必查）
+
+当 `available` 归零后，Linux 内核会启动 **OOM Killer**，按 `oom_score` 挑一个"最该死"的进程杀掉。事后现场排查靠内核日志：
+
+#### 1）查最近有没有发生 OOM
+
+```bash
+# 方式一：内核环形缓冲（重启后消失）
+dmesg -T | grep -iE 'oom|killed process|out of memory'
+
+# 方式二：journalctl（推荐，跨重启也在）
+sudo journalctl -k | grep -iE 'oom|killed process|out of memory'
+sudo journalctl --since "1 hour ago" -k | grep -i oom
+
+# 方式三：/var/log/messages（老系统）
+sudo grep -i 'oom\|killed process' /var/log/messages
+```
+
+典型日志片段：
+
+```
+Out of memory: Killed process 12345 (java) total-vm:8388608kB, anon-rss:6291456kB, ...
+```
+
+关键信息：**被杀的 PID / 进程名 / 当时的 anon-rss（真实占用）**。
+
+#### 2）看谁最"招人恨"（OOM 打分）
+
+```bash
+# 当前系统所有进程按 oom_score 排序，分数最高的最可能被杀
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+  score=$(cat /proc/$pid/oom_score 2>/dev/null)
+  cmd=$(cat /proc/$pid/comm 2>/dev/null)
+  [ -n "$score" ] && echo "$score $pid $cmd"
+done | sort -nr | head -n 20
+```
+
+#### 3）保护关键进程，避免被 OOM 杀掉
+
+```bash
+# oom_score_adj 范围 -1000 ~ 1000
+# -1000 = 永不杀（除非它就是罪魁），1000 = 优先杀
+echo -500 | sudo tee /proc/<PID>/oom_score_adj
+
+# systemd 服务持久化配置（推荐）
+# 在 unit 文件的 [Service] 段加：
+# OOMScoreAdjust=-500
+```
+
+> 呼应第 28 节：注册为 systemd 服务时可直接在 unit 里写 `OOMScoreAdjust`，避免每次重启后失效。
+
+---
+
+### 六、📈 长期监控与趋势分析
+
+#### 1）`vmstat`：看虚拟内存 & swap 换页速率
+
+```bash
+vmstat 1 5                  # 每秒采样，共 5 次
+```
+
+重点列：
+- `si` / `so`：**swap in / swap out**（**>0 且持续，就是 swap 抖动，性能雪崩前兆**）
+- `free` / `buff` / `cache`：内存分布
+- `us` / `sy` / `id` / `wa`：CPU 分布（`wa` 高表示 IO 等待，常伴随 swap）
+
+#### 2）`sar`：历史内存趋势（需要 sysstat 包）
+
+```bash
+sudo yum install -y sysstat
+sudo systemctl enable --now sysstat
+
+sar -r                      # 查看今天的内存使用历史（每 10 分钟采样）
+sar -r -f /var/log/sa/sa15  # 查看本月 15 号的历史
+sar -S                      # 查看 swap 使用历史
+sar -B                      # 查看 paging 统计
+```
+
+> `sar` 是**回溯式排查神器**：故障发生在半夜，早上上班就靠它来复盘。
+
+#### 3）`slabtop`：内核对象缓存（怀疑内核内存泄漏时）
+
+```bash
+sudo slabtop -o             # 按内存占用排序，一次性输出快照
+```
+
+大户通常是 `dentry`、`inode_cache`、`kmalloc-*` 等。
+
+---
+
+### 七、🧯 一套「内存告急/OOM」应急排查 SOP
+
+按顺序照抄即可 ⬇️
+
+```bash
+# 1. 看整体：available 还剩多少？swap 有没有开始动？
+free -h
+free -h -s 2                              # 持续观察 10 秒左右
+
+# 2. 找到内存大户 Top 10
+ps -eo pid,user,rss,vsz,%mem,cmd --sort=-rss | head -n 11
+
+# 3. 看是否已经开始 swap 抖动
+vmstat 1 5                                # 关注 si/so 是否持续 >0
+
+# 4. 看 OOM 是否已经发生过
+sudo journalctl -k --since "1 hour ago" | grep -iE 'oom|killed process'
+dmesg -T | tail -50 | grep -iE 'oom|killed'
+
+# 5. 若怀疑内存泄漏，锁定单个进程持续观察
+watch -n 2 "grep -E 'VmRSS|VmSwap' /proc/<PID>/status"
+
+# 6. 紧急缓解（选一，非根治）
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches   # 释放 page cache（副作用：IO 变慢）
+sudo systemctl restart <泄漏进程所在服务>              # 重启回收内存
+
+# 7. 复核
+free -h
+```
+
+---
+
+### 八、📌 命令速查表（背下来这一张就够用）
+
+| 需求 | 命令 |
+|---|---|
+| 看整体内存 / swap | `free -h` |
+| 附带汇总行 | `free -h -t` |
+| 持续观察 | `free -h -s 2` 或 `watch -n 1 free -h` |
+| 原始详细内存指标 | `cat /proc/meminfo` |
+| 交互式按内存排序 | `top`（按 `M`）/ `htop`（F6 选 MEM） |
+| Top 20 内存进程 | `ps aux --sort=-%mem \| head -21` |
+| 按 RSS 排序（更真实） | `ps -eo pid,user,rss,%mem,cmd --sort=-rss \| head` |
+| 单进程内存映射 | `pmap -x <PID>` |
+| 单进程内存/swap 详情 | `grep -E 'Vm\|Rss' /proc/<PID>/status` |
+| 看 swap 设备 | `swapon --show` |
+| 谁在用 swap | 遍历 `/proc/*/status` 的 `VmSwap`（见正文脚本） |
+| swap 换页速率 | `vmstat 1` 的 `si` / `so` 列 |
+| 内存历史趋势 | `sar -r`、`sar -S` |
+| 内核对象缓存 | `sudo slabtop -o` |
+| OOM 事件日志 | `dmesg -T \| grep -i oom` 或 `journalctl -k \| grep -i oom` |
+| 保护进程不被 OOM 杀 | 写 `oom_score_adj`，systemd 用 `OOMScoreAdjust` |
+| 调整 swap 倾向 | `sysctl vm.swappiness=10` |
+| 强制释放 page cache | `echo 3 > /proc/sys/vm/drop_caches`（谨慎） |
+
+---
+
+### 九、⚠️ 常见坑与经验
+
+1. **不要盯着 `free` 列看空闲——要看 `available`**。Linux 的 buff/cache 是"可回收的可用内存"，它满不代表内存紧张。
+2. **`VIRT`/`VSZ` 虚高别惊慌**——Java、Go 进程动辄几十 G VIRT，真实占用看 `RES`/`RSS`。
+3. **`Swap.used > 0` 不等于内存不够**——内核可能出于策略把长期不动的匿名页换出去了；**真正的危险信号是 `si`/`so` 持续大于 0**（swap 抖动）。
+4. **`echo 3 > /proc/sys/vm/drop_caches` 慎用**——它会清 page cache，短期看 `free` 变大，但**下一次 IO 会变慢**，仅适合诊断，不适合作为运维手段。
+5. **容器内的 `free` 不准**——cgroup v1 时代 `free` 看到的是宿主机的内存；**容器内查内存请看 `/sys/fs/cgroup/memory/memory.usage_in_bytes` 或 `memory.max`**（cgroup v2）。
+6. **`ps` 的 RSS 会重复计算共享内存**——多个进程用同一个 `libc.so`，各自 RSS 里都算了一份；想精确请用 `smem -tk` 看 `PSS`（比例集）。
+7. **OOM 被杀不一定是"内存最多"的进程**——内核挑的是 `oom_score` 最高的，可能是 `oom_score_adj` 设置不当的进程。
+8. **swap 不是越大越好**——生产环境常见配置为 **物理内存的 0.5~1 倍**，甚至关掉 swap（数据库场景），配合 `vm.swappiness=1`。
+9. **内存泄漏诊断三板斧**：`ps` 看趋势、`pmap -x` 看映射、语言层面工具（Java 的 `jmap`/`jcmd`、Go 的 `pprof`、Python 的 `tracemalloc`）。
+10. **突然 OOM 却没日志**——可能是被云厂商的**内存不足强制关机**（例如 ECS 内存超卖场景），去云控制台看主机层告警。
+
+---
+
+### 十、一句话总结
+
+> **`free` 看整体（看 `available` 不看 `free`），`top`/`ps --sort=-rss` 抓大户，`pmap` / `/proc/<PID>/status` 深挖单进程；`vmstat 1` 看 `si`/`so` 判断 swap 抖动，`journalctl -k | grep oom` 复盘 OOM。**  
+> **一条排查主线：`free -h → ps --sort=-rss → vmstat/pmap 深挖 → dmesg/journalctl 查 OOM → 重启进程或加内存 → 复核 `free -h`。**
 
 ---
 
