@@ -32,6 +32,8 @@
 - [28. 在云服务器上把应用注册为 systemd 系统级服务](#28-在云服务器上把应用注册为-systemd-系统级服务)
 - [29. 为什么生产环境中要用低权限用户跑业务进程](#29-为什么生产环境中要用低权限用户跑业务进程)
 - [30. 云服务器上查看当前有哪些用户](#30-云服务器上查看当前有哪些用户)
+- [31. 查看与回收指定用户的 sudo 权限](#31-查看与回收指定用户的-sudo-权限)
+- [32. 如何给一个用户赋予 sudo 权限](#32-如何给一个用户赋予-sudo-权限)
 
 ---
 
@@ -5995,9 +5997,10 @@ CVE-2022-0847（Dirty Pipe）允许容器内任意用户改写只读文件——
 sudo useradd -r -s /sbin/nologin -d /opt/mildlab mildlab
 ```
 
-- `-r`：**系统账户**（UID < 1000，不占普通用户段）
-- `-s /sbin/nologin`：**禁止 shell 登录**——即使密钥泄露也无法交互式登录
+- `-r`：**创建的是系统账户**（UID < 1000，不占普通用户段），默认不会设置密码
+- `-s /sbin/nologin`：**禁止 shell 登录**——即使密钥泄露也无法交互式登录。该选项指定了登录 shell 为 nologin，任何登录尝试都会直接被拒绝（即使设置了密码也无法登录）
 - `-d /opt/mildlab`：家目录
+- 该用户仅用于运行服务或进程，无需密码登录。如需设置密码，需使用 passwd mildlab 单独设置
 
 #### 2. 严格设置目录权限
 
@@ -6216,6 +6219,456 @@ getent group wheel               # CentOS/RHEL：wheel 组成员
 
 > **`/var/run/utmp` 告诉你「谁在在线」，`/etc/passwd` 告诉你「有哪些账号」，`last` 告诉你「过去谁登过」。**  
 > **日常用 `w`、审计用 `last`、排查入侵用 `awk` 扫 `UID=0` 与 `/bin/bash` 行，三招就能看住大部分场景。**
+
+---
+
+## 31. 查看与回收指定用户的 sudo 权限
+
+### 问题
+1. 如何查看云服务器上某个用户（如 `yan`、`lyy`）是否拥有 sudo 权限？
+2. 如何将一个已有 sudo 权限的用户降级为普通用户？
+
+### 解答
+
+sudo 权限的来源有两种主途径：**组授权**（如 `wheel` / `sudo` 组）和**直接写入 sudoers**（`/etc/sudoers` 或 `/etc/sudoers.d/*`）。因此无论是查看还是回收，都要先**定位权限来源**，再对症下药。
+
+---
+
+### 一、🔍 查看用户是否拥有 sudo 权限
+
+#### 方法1（首选）：`sudo -l -U <user>`
+
+直接让 sudo **模拟解析**该用户的完整策略，不需要自己去拼接多个文件：
+
+```bash
+sudo -l -U yan
+sudo -l -U lyy
+```
+
+**输出解读**：
+
+| 输出 | 含义 |
+|---|---|
+| `User yan is not allowed to run sudo on <host>.` | 🟢 **无** sudo 权限 |
+| `User lyy may run the following commands ...` + `(ALL) ALL` | 🔴 **完整** sudo 权限（可以任意用户身份执行任意命令） |
+| `(ALL) /usr/bin/systemctl restart nginx` 等特定命令 | 🟡 **部分** sudo 权限 |
+
+> 💡 `sudo -l -U` 自己就能看；但想看其他用户需要**当前用户具备 sudo 权限**。
+
+#### 方法2：直接搜 sudoers
+
+```bash
+sudo grep -rE "^\s*(yan|lyy)\b" /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+```
+
+- 如果看到 `yan ALL=(ALL) ALL` → 直接写在了 sudoers 里（**直接规则**）
+- 如果什么都没搜到，但 `sudo -l -U` 还是能跑 → 很可能是通过**组授权**（%wheel / %sudo）
+
+#### 方法3：看组成员
+
+```bash
+groups yan
+groups lyy
+getent group wheel   # CentOS/RHEL 默认管理员组
+getent group sudo    # Ubuntu/Debian 默认管理员组
+```
+
+若 `groups lyy` 输出 `lyy : lyy` → **只属于同名用户主组**，没任何管理组，则权限一定来自直接写在 sudoers 中的规则。
+
+---
+
+### 二、🧭 权限来源判断流程（决策图）
+
+```mermaid
+flowchart TD
+    A[sudo -l -U user] -->|no sudo| Z[无权限✅]
+    A -->|(ALL) ALL 或部分命令| B{sudo grep -r user /etc/sudoers /etc/sudoers.d/}
+    B -->|命中| C[直接规则: 编辑 sudoers 删除一行]
+    B -->|未命中| D{groups user}
+    D -->|包含 wheel / sudo| E[组授权: gpasswd -d 移出组]
+    D -->|只有同名组| F[重新搜集：User_Alias / 包含文件]
+```
+
+---
+
+### 三、🛠️ 将已有权限的用户降为普通用户
+
+#### 情况 A：权限来自组（`wheel` / `sudo`）
+
+```bash
+sudo gpasswd -d lyy wheel   # CentOS/RHEL
+sudo gpasswd -d lyy sudo    # Ubuntu/Debian
+```
+
+仅把用户从管理员组里剔除，不删用户本身。
+
+#### 情况 B：权限来自 sudoers 直接规则
+
+**必须用 `visudo`**，它会做语法校验，防止写错导致 sudo 整个不可用：
+
+```bash
+sudo visudo                     # 编辑主文件 /etc/sudoers
+sudo visudo -f /etc/sudoers.d/lyy   # 编辑子文件
+sudo visudo -c                  # 仅检查语法，不编辑
+```
+
+在文件中定位到（通常在 `root ALL=(ALL) ALL` 下方）：
+
+```
+lyy     ALL=(ALL)       ALL
+```
+
+处理方式（任选一种）：
+- 直接**删除整行**
+- 或**行首加 `#` 注释**：`# lyy     ALL=(ALL)       ALL`
+
+保存退出（vi 模式下 `:wq`），`visudo` 会自动校验。若语法有误会提示重新编辑，**千万不要选 abandon，否则修改会丢失**。
+
+#### 情况 C：两者共存
+
+先按情况 B 处理直接规则，再按情况 A 剔除管理员组，**逐个回收直到 `sudo -l -U` 提示 not allowed**。
+
+---
+
+### 四、✅ 验证收回结果
+
+```bash
+sudo -l -U lyy
+```
+
+预期输出：
+
+```
+User lyy is not allowed to run sudo on <host>.
+```
+
+看到这句 → 权限已成功回收。
+
+---
+
+### 五、📖 真实案例：处理 `yan` 与 `lyy`
+
+**背景**：
+
+```bash
+sudo -l -U yan
+# → User yan is not allowed to run sudo on VM-0-4-centos.
+
+sudo -l -U lyy
+# → User lyy may run the following commands on VM-0-4-centos:
+#         (ALL) ALL
+
+groups lyy
+# → lyy : lyy          ← 不属于任何管理组
+
+sudo grep -r "lyy" /etc/sudoers /etc/sudoers.d/
+# → /etc/sudoers:lyy     ALL=(ALL)       ALL
+```
+
+**结论**：
+- `yan` 无 sudo 权限，无需处理。
+- `lyy` 的权限来自 `/etc/sudoers` 里的直接规则（非组授权）。
+
+**回收步骤**：
+
+```bash
+sudo visudo
+```
+
+定位到：
+
+```
+root    ALL=(ALL)       ALL
+lyy     ALL=(ALL)       ALL     ← 删除或行首加 #
+```
+
+保存退出 → 验证：
+
+```bash
+sudo -l -U lyy
+# → User lyy is not allowed to run sudo on VM-0-4-centos.
+```
+
+完成。
+
+---
+
+### 六、⚠️ 注意事项与避坑
+
+1. **永远用 `visudo` 而非 `vim`/`nano` 直接改 `/etc/sudoers`**  
+   `visudo` 会语法校验并锁定文件，一旦语法错误会担心 sudo 整体不可用（一不小心就需要单用户模式救回）。
+
+2. **保留至少一个拥有 sudo 权限的账户**  
+   回收前确保 `root` 可登录（或已有另一个 wheel 用户），否则可能将自己锁在外面。
+
+3. **`/etc/sudoers.d/` 下的文件也要排查**  
+   一些面板（如 CloudInit、运维工具）会向 `/etc/sudoers.d/` 里注入规则，而不是直接改主文件。
+
+4. **`User_Alias` / `Cmnd_Alias` 的情况**  
+   若 grep 不到用户名，但 `sudo -l -U` 有输出，可能被归入 `User_Alias ADMINS = lyy, ...`，需搜 `User_Alias`。
+
+5. **只剔除部分权限而非完全回收**  
+   可把行改小作用域，例如只允许 systemctl：
+   ```
+   lyy ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+   ```
+
+6. **已开启的 sudo 会话不会立即失效**  
+   `sudo` 默认有 5 分钟 timestamp；若需立即生效可执行 `sudo -k` 或让用户重新登录。
+
+---
+
+### 七、📌 一张表快速回忆
+
+| 需求 | 命令 |
+|---|---|
+| 看某用户有无 sudo | `sudo -l -U <user>` |
+| 定位直接规则 | `sudo grep -rE "^\s*<user>\b" /etc/sudoers /etc/sudoers.d/` |
+| 判断是否依靠组 | `groups <user>` 、`getent group wheel\|sudo` |
+| 剔除组成员 | `sudo gpasswd -d <user> wheel` |
+| 编辑主 sudoers | `sudo visudo` |
+| 编辑子 sudoers | `sudo visudo -f /etc/sudoers.d/<file>` |
+| 语法自检 | `sudo visudo -c` |
+| 验证已回收 | `sudo -l -U <user>` 看到 `not allowed` |
+
+---
+
+### 八、一句话总结
+
+> **看权限用 `sudo -l -U`，定位来源用 `grep` + `groups`，回收直接规则用 `visudo`，回收组权限用 `gpasswd -d`，收尾一定 `sudo -l -U` 再验一次。**  
+> **修改 sudoers 只走 `visudo`——这条铁律能为你避开 90% 的权限事故。**
+
+---
+
+## 32. 如何给一个用户赋予 sudo 权限
+
+### 问题
+如何给云服务器上的一个用户（例如 `yan`）赋予 sudo 权限？
+
+### 解答
+
+授予 sudo 权限有**两种标准方式**：
+
+- **方法一：把用户加入管理组（`wheel` / `sudo`）**——推荐，易维护，与大多数发行版的默认机制契合。
+- **方法二：在 `sudoers` 中直接写规则**——适合**自定义、限定命令集**的场景。
+
+两种方式本质上都是往 `sudoers` 里添加规则，但前者通过「组”间接命中 `%wheel ALL=(ALL) ALL` 默认规则，后者直接就用户名写规则。
+
+---
+
+### 一、🧭 就地判断系统默认管理组
+
+不同发行版约定不同，先搞清楚你的系统用哪个组：
+
+```bash
+grep -E "^%wheel|^%sudo" /etc/sudoers
+```
+
+| 输出 | 含义 | 典型发行版 |
+|---|---|---|
+| 包含 `%wheel ALL=(ALL) ALL` | 用 **wheel 组** | CentOS / RHEL / Rocky / AlmaLinux / openSUSE |
+| 包含 `%sudo ALL=(ALL:ALL) ALL` | 用 **sudo 组** | Ubuntu / Debian |
+| 两个都没 | 默认无组规则 | 需走方法二 |
+
+> 💡 部分系统上 `%wheel` 行被注释了（行首带 `#`），**需先用 `visudo` 取消注释**，否则加入 wheel 组也不会生效。
+
+---
+
+### 二、✅ 方法一：把用户加入管理组（推荐）
+
+#### 1）加入组
+
+```bash
+# CentOS / RHEL 系
+sudo usermod -aG wheel yan
+
+# Ubuntu / Debian 系
+sudo usermod -aG sudo yan
+```
+
+**`-aG` 两个参数缺一不可**：
+- `-G`：指定附加组列表
+- `-a`（append）：**追加**而不是覆盖——忘写 `-a` 会把用户从其他已有组里剔除，**很容易造成用户丢失其他已有权限**。
+
+#### 2）验证组成员
+
+```bash
+groups yan
+# 预期：yan : yan wheel   或   yan : yan sudo
+```
+
+#### 3）验证 sudo 行为
+
+```bash
+sudo -l -U yan
+```
+
+成功后会看到类似：
+
+```
+User yan may run the following commands on <host>:
+    (ALL) ALL
+```
+
+#### 4）❗前提：重新登录才能生效
+
+- 用户当前的 shell 会话已经在旧组上下文里，**新组不会自动生效**。
+- 【方式 1】退出后重新 SSH 登录 → 最干净。
+- 【方式 2】临时切换主组：
+  ```bash
+  newgrp wheel   # 或 newgrp sudo
+  ```
+
+---
+
+### 三、🛠️ 方法二：在 sudoers 中直接写规则（自定义）
+
+适用于两种场景：没有默认管理组；或需要**只授予特定命令**而非全部。
+
+#### 1）编辑入口
+
+**千万不要直接用 `vim`/`nano` 改 `/etc/sudoers`**，必须走 `visudo`（自带锁定 + 语法校验，避免写坏造成 sudo 完全不可用）：
+
+```bash
+sudo visudo                          # 主文件 /etc/sudoers
+sudo visudo -f /etc/sudoers.d/yan    # 或写到子文件（推荐）
+sudo visudo -c                       # 仅检查语法
+```
+
+> 💡 **推荐写入 `/etc/sudoers.d/<user>`** 而非主文件：一个用户一个文件，后续排查、回收均可直接删文件，不会弄脏主文件。
+
+#### 2）写规则
+
+完全权限：
+
+```
+yan     ALL=(ALL)       ALL
+```
+
+只允许特定命令：
+
+```
+yan     ALL=(ALL)       /usr/bin/systemctl restart nginx, /usr/bin/systemctl status nginx
+```
+
+免密码执行（谨慎）：
+
+```
+yan     ALL=(ALL)       NOPASSWD: /usr/bin/systemctl restart nginx
+```
+
+**字段含义（埋点知识）**：
+
+```
+<who>   <where>=(<as_whom>) <cmd>
+│       │       │           └─ 允许执行的命令（全路径；支持逗号列表）
+│       │       └─ 可以切换到哪些目标用户（常为 ALL 或 root）
+│       └─ 允许从哪些主机执行（常为 ALL；多机共享 sudoers 时才需区分）
+└─ 被授权对象（用户名或 %组名）
+```
+
+例如，要给 lyy 添加编辑 nginx 配置文件和重启、启动、热重载（不中断服务）、停止 nginx 并查看运行状态的权限可以在执行 visudo -f /etc/sudoers.d/yan 后添加如下内容：
+
+```script
+# 给 lyy 用户添加编辑 nginx 配置文件的权限
+lyy ALL=(ALL) /usr/bin/vim /etc/nginx/nginx.conf
+
+# 给 lyy 用户添加重启、启动、热重载、停止 nginx 并查看运行状态的权限
+lyy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl start nginx, /usr/bin/systemctl reload nginx, /usr/bin/systemctl stop nginx, /usr/bin/systemctl status nginx
+```
+
+⚠️注意，在上面这个 case 中实际上有一个潜在风险：通过 sudo vim 编辑文件，用户可以执行 :!bash 获得 root shell。
+
+更安全的替代方案是：使用 sudoedit 授权，如：lyy ALL=(ALL) sudoedit /etc/nginx/nginx.conf（仅允许编辑，不能执行 shell）。
+
+或直接将 lyy 加入 nginx 组，并设置文件权限为 640，避免使用 sudo。
+
+即最终推荐配置是：
+
+```
+# 允许 sudoedit 安全编辑（不触发 shell）
+lyy ALL=(ALL) sudoedit /etc/nginx/nginx.conf
+
+# 免密控制 nginx
+lyy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl start nginx, /usr/bin/systemctl reload nginx, /usr/bin/systemctl stop nginx, /usr/bin/systemctl status nginx
+```
+
+#### 3）保存退出 + 验证
+
+保存退出（vi 模式 `:wq`），`visudo` 会自动校验。**若提示语法错误，选择重新编辑，千万不要 abandon——否则修改会丢失**。
+
+```bash
+sudo -l -U yan
+# → (ALL) ALL   或   (ALL) /usr/bin/systemctl ...
+```
+
+---
+
+### 四、🔐 权限粒度设计建议
+
+1. **遵循最小权限（PoLP）**：能限定命令就不写 `(ALL) ALL`，尤其是业务共用账号。
+2. **失败审计友好**：不要无必要地给 `NOPASSWD`——密码马上就是一层护城河。
+3. **命令写全路径**：`sudoers` 要求命令为绝对路径，避免因 `PATH` 差异造成绥权风险。
+4. **少用直接用户规则**，多用组 + `usermod -aG`，方便批量授/收。
+5. **变更记录**：专有 `/etc/sudoers.d/<user>` 文件 + git 版本化目录，便于审计与回滚。
+
+---
+
+### 五、⚠️ 避坑清单
+
+1. **一定用 `visudo`**：直接编辑 sudoers 写错会导致 sudo 整体不可用——只能单用户模式救回。
+2. **`usermod -G` 必需 `-a`**：忘写 `-a` 会覆盖附加组列表，把用户从其他组里“踢”出去。
+3. **新组需重新登录**：当前会话拿不到新组，`groups` 看到了但 `sudo` 仍不能用，重新 SSH 即可。
+4. **确认 `%wheel` 行未被注释**：部分系统默认把它注释，仅把用户入组也不生效。
+5. **保留备用管理员**：任何变更前确保 `root` 可登录或现有管理员可用，避免把自己锁在外。
+6. **不要把服务进程用户加入 wheel**（如 `mildlab`）：业务进程一旦被攻破，相当于直接送上 root，与第 29 节铁律相悡。
+
+---
+
+### 六、📖 实战例：给 `yan` 赋予完整 sudo 权限（CentOS）
+
+```bash
+# 1. 确认系统用 wheel 组
+grep -E "^%wheel" /etc/sudoers
+# → %wheel  ALL=(ALL)       ALL
+
+# 2. 将 yan 加入 wheel 组
+sudo usermod -aG wheel yan
+
+# 3. 验证组成员
+groups yan
+# → yan : yan wheel
+
+# 4. 验证 sudo 行为（必要时重新登录）
+sudo -l -U yan
+# → User yan may run the following commands on <host>:
+#         (ALL) ALL
+```
+
+一行命令完成，无需碰 `sudoers` 主文件。
+
+---
+
+### 七、📌 一张表快速回忆
+
+| 需求 | 命令 |
+|---|---|
+| 看默认管理组 | `grep -E "^%wheel\|^%sudo" /etc/sudoers` |
+| 加入 wheel | `sudo usermod -aG wheel <user>` |
+| 加入 sudo | `sudo usermod -aG sudo <user>` |
+| 临时切主组 | `newgrp wheel` 代替重登 |
+| 写完全权限 | `visudo` → `<user> ALL=(ALL) ALL` |
+| 写限定命令 | `visudo` → `<user> ALL=(ALL) /usr/bin/xxx, /usr/bin/yyy` |
+| 写子文件 | `sudo visudo -f /etc/sudoers.d/<user>` |
+| 验证权限 | `sudo -l -U <user>` |
+| 仅检查语法 | `sudo visudo -c` |
+
+---
+
+### 八、一句话总结
+
+> **首选 `usermod -aG wheel|sudo <user>` —— 最简单、最主流、最容易回收；需要限定命令时才去写 `/etc/sudoers.d/<user>` —— 内容、命名、回收均以文件为单位，干净可审计。**  
+> **两条铁律：`-aG` 不要忘 `-a`；修改 sudoers 只走 `visudo`。**
 
 ---
 
