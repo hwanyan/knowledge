@@ -49,6 +49,9 @@
 - [1. sudo tee 命令的作用](#1-sudo-tee-命令的作用)
 - [2. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）](#2-为什么-psql-在--usr--下，而-mysql-在--usr-local--下fhs-与安装方式)
 
+### 数据库相关
+- [PostgreSQL 常用命令速查](#postgresql-常用命令速查)
+
 ---
 
 ## 后台开发相关
@@ -61,6 +64,10 @@
 2. **园区游玩**：每次玩项目，刷手环就行，不用再次验证身份证（携带 Token 请求）
 3. **信息传递**：手环信息通过闸机传给后台，后台知道你是谁、有什么权限（Context 传递）
 4. **服务调用**：后台服务之间互相传递你的信息，确保全程服务一致（微服务间传递）
+
+---
+
+## 数据库相关
 
 ---
 
@@ -7790,5 +7797,226 @@ Debian/Ubuntu 系用 `dpkg -S <path>`。
 
 ---
 
+
+
+
+
+---
+
+## PostgreSQL 常用命令速查
+
+> 本文档汇总了 PostgreSQL 日常开发与运维中最常用的命令，涵盖连接服务、psql 交互、数据操作、用户权限、备份恢复及性能监控等核心环节。
+
+---
+
+#### 🔌 一、连接与服务管理
+
+**psql 客户端连接**
+
+```bash
+# 基础连接（-h 主机, -p 端口, -U 用户名, -d 数据库名, -W 提示输入密码）
+psql -h localhost -p 5432 -U postgres -d postgres
+
+# 连接并执行单条 SQL 后退出
+psql -U postgres -d mydb -c "SELECT * FROM users;"
+
+# 执行外部 SQL 文件
+psql -U postgres -d mydb -f /path/to/script.sql
+
+# 简写方式（直接指定数据库名）
+psql -U postgres mydb
+```
+
+**pg_ctl 服务管理**
+
+```bash
+pg_ctl start   -D /usr/local/pgsql/data   # 启动服务
+pg_ctl stop    -D /usr/local/pgsql/data   # 停止服务
+pg_ctl restart -D /usr/local/pgsql/data   # 重启服务
+pg_ctl status  -D /usr/local/pgsql/data   # 查看服务状态
+```
+
+**命令行快捷工具**
+
+```bash
+createdb -U postgres my_new_db                        # 创建数据库
+createuser -U postgres --interactive my_new_user      # 创建用户
+```
+
+---
+
+#### 🎮 二、psql 元命令速查
+
+| 命令 | 说明 | 备注 |
+|------|------|------|
+| `\l` 或 `\list` | 列出所有数据库 | `\l+` 查看详细信息 |
+| `\c [dbname]` | 连接到指定数据库 | `\c mydb` |
+| `\dt` | 列出当前数据库的所有表 | `\dt *.*` 列出所有 schema 的表 |
+| `\d [table]` | 显示表结构 | `\d+ users` 显示更多信息 |
+| `\du` | 列出所有角色/用户 | |
+| `\dn` | 列出所有 schema（模式） | |
+| `\q` | 退出 psql | |
+| `\?` | 显示所有 psql 元命令帮助 | |
+| `\h [cmd]` | 查看 SQL 命令语法帮助 | `\h CREATE INDEX` |
+| `\x` | 开启/关闭扩展显示模式 | 宽表查询更清晰 |
+| `\i [file]` | 执行外部 SQL 文件 | `\i /path/to/script.sql` |
+| `\o [file]` | 将查询结果输出到文件 | `\o output.txt` |
+| `\s` | 查看命令历史 | |
+| `\copy` | 表数据导出到本地 CSV | `\copy (SELECT * FROM users) TO 'users.csv' WITH CSV` |
+
+**psql 使用技巧：**
+
+- **格式化输出**：宽表查询前先 `\x` 开启扩展显示；导出 CSV 时先 `\pset format csv`，再执行查询
+- **便捷操作**：`\s` 查历史，`\i 文件名.sql` 执行外部脚本，`\o 文件路径` 导出结果到文件
+
+---
+
+#### 📝 三、数据库与表操作
+
+| 操作 | 命令 |
+|------|------|
+| 创建/删除数据库 | `CREATE DATABASE dbname;` / `DROP DATABASE dbname;` |
+| 创建/删除模式 | `CREATE SCHEMA schemaname;` / `DROP SCHEMA schemaname;` |
+| 删除表 | `DROP TABLE tablename;` |
+| 添加字段 | `ALTER TABLE tablename ADD COLUMN colname type;` |
+| 删除字段 | `ALTER TABLE tablename DROP COLUMN colname;` |
+| 重命名字段 | `ALTER TABLE tablename RENAME COLUMN old TO new;` |
+| 修改字段类型 | `ALTER TABLE tablename ALTER COLUMN colname TYPE new_type;` |
+| 表添加注释 | `COMMENT ON TABLE table_name IS '描述文本';` |
+| 字段添加注释 | `COMMENT ON COLUMN table_name.col_name IS '描述文本';` |
+
+**基本数据操作：**
+
+```sql
+SELECT * FROM 表名;                              -- 查询
+INSERT INTO 表名 VALUES (...);                    -- 插入
+UPDATE 表名 SET 列名=值 WHERE ...;                -- 更新
+DELETE FROM 表名 WHERE ...;                       -- 删除
+```
+
+---
+
+#### 👥 四、用户与权限管理
+
+**角色/用户创建与删除：**
+
+```sql
+-- CREATE USER 是 CREATE ROLE ... WITH LOGIN 的简写
+CREATE USER user_name WITH PASSWORD 'password';
+CREATE ROLE role_name WITH LOGIN PASSWORD 'password';
+
+-- 创建超级用户
+CREATE ROLE super_admin WITH SUPERUSER LOGIN PASSWORD 'password';
+
+-- 删除角色（IF EXISTS 和 CASCADE 可选）
+DROP ROLE [IF EXISTS] role_name [CASCADE];
+```
+
+**权限修改（ALTER）：**
+
+```sql
+ALTER ROLE user_name WITH PASSWORD 'new_password';    -- 修改密码
+ALTER ROLE user_name WITH LOGIN;        -- 允许登录
+ALTER ROLE user_name WITH NOLOGIN;      -- 禁止登录
+ALTER ROLE user_name WITH SUPERUSER;    -- 授予超级用户
+ALTER ROLE user_name WITH NOSUPERUSER;  -- 撤销超级用户
+ALTER ROLE user_name WITH CREATEDB;     -- 允许创建数据库
+ALTER ROLE user_name WITH NOCREATEDB;   -- 禁止创建数据库
+```
+
+**权限授予与撤销（GRANT / REVOKE）：**
+
+```sql
+-- 数据库级别
+GRANT ALL PRIVILEGES ON DATABASE dbname TO username;
+REVOKE ALL PRIVILEGES ON DATABASE dbname FROM username;
+
+-- Schema 级别
+GRANT SELECT ON ALL TABLES IN SCHEMA schemaname TO username;
+
+-- 表级别（精细权限：SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER）
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE tablename TO username;
+```
+
+---
+
+#### 📦 五、备份与恢复
+
+| 命令 | 说明 |
+|------|------|
+| `pg_dump mydb > backup.sql` | 将数据库备份为纯文本 SQL 脚本 |
+| `pg_dump mydb -F c -f backup.dump` | 以自定义压缩格式备份，适合 pg_restore |
+| `pg_dump -t mytable mydb > table_backup.sql` | 仅备份特定表 |
+| `pg_dumpall > all_dbs.sql` | 备份整个集群（含用户、全局对象） |
+| `pg_dump mydb \| gzip > backup.sql.gz` | 直接压缩备份结果 |
+| `psql mydb < backup.sql` | 从纯文本 SQL 脚本恢复 |
+| `pg_restore -d mydb backup.dump` | 从自定义格式备份恢复 |
+| `pg_basebackup -D /backup_dir` | 创建集群基础物理备份 |
+| `pg_basebackup -D /backup_dir -F t -z -P` | 打包压缩物理备份（-P 显示进度） |
+
+---
+
+#### 📊 六、性能分析与监控
+
+**执行计划分析：**
+
+```sql
+-- 显示预估执行计划（不实际执行）
+EXPLAIN SELECT * FROM users WHERE name = 'John';
+
+-- 显示实际执行计划和运行时间（会真实执行 SQL）
+EXPLAIN ANALYZE SELECT * FROM users WHERE name = 'John';
+```
+
+> `EXPLAIN` 仅显示预估计划；`EXPLAIN ANALYZE` 会真实执行 SQL，提供实际运行时间和行数，是优化查询的关键手段。
+
+**系统状态监控：**
+
+```sql
+-- 查看当前所有活跃查询
+SELECT * FROM pg_stat_activity;
+
+-- 查看执行超过5分钟的慢查询
+SELECT pid, now() - query_start AS duration, query, state
+FROM pg_stat_activity
+WHERE state = 'active' AND (now() - query_start) > interval '5 minutes';
+
+-- 更新表统计信息（供查询优化器使用，不指定表名则分析当前库所有表）
+ANALYZE [table_name];
+
+-- 查看数据库全部配置参数
+SELECT name, setting FROM pg_settings;
+
+-- 查看特定参数当前值（如最大连接数）
+SHOW max_connections;
+```
+
+**第三方工具：**
+
+- **pg_activity**：终端实时监控数据库活动，类似 `top`
+- **pgbench**：PostgreSQL 自带的基准测试工具，用于模拟负载
+
+---
+
+#### 🛠️ 七、实用脚本速查
+
+```sql
+-- 查看某张表的索引
+SELECT * FROM pg_indexes WHERE tablename = 'your_table_name';
+
+-- 估算表的近似行数（非常快，适合超大表）
+SELECT reltuples AS approximate_row_count FROM pg_class WHERE relname = 'your_table_name';
+
+-- 查看当前数据库名称
+SELECT current_database();
+
+-- 查看当前连接用户
+SELECT current_user;
+
+-- 查看 PostgreSQL 版本
+SELECT version();
+```
+
+---
 
 
