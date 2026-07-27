@@ -5990,6 +5990,7 @@ sudo useradd -r -s /sbin/nologin -d /opt/mildlab mildlab
 - `-s /sbin/nologin`：**禁止 shell 登录**——即使密钥泄露也无法交互式登录。该选项指定了登录 shell 为 nologin，任何登录尝试都会直接被拒绝（即使设置了密码也无法登录）
 - `-d /opt/mildlab`：家目录
 - 该用户仅用于运行服务或进程，无需密码登录。如需设置密码，需使用 passwd mildlab 单独设置
+- 使用 `sudo userdel username` 删除 `username` 用户
 
 #### 2. 严格设置目录权限
 
