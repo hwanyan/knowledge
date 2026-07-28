@@ -44,6 +44,7 @@
 - [18. 查看云服务器存储空间使用情况的运维命令速查](#18-查看云服务器存储空间使用情况的运维命令速查)
 - [19. 查看云服务器内存使用情况的运维命令速查](#19-查看云服务器内存使用情况的运维命令速查)
 - [20. Linux 目录权限中 x（执行位）的作用——为什么有读写权限却无法访问目录下的文件](#20-linux-目录权限中-x执行位的作用为什么有读写权限却无法访问目录下的文件)
+- [21. systemd 服务启动失败 status=226/NAMESPACE ReadWritePaths 指向的目录不存在](#21-systemd-服务启动失败-status226namespace-readwritepaths-指向的目录不存在)
 
 ### 服务器通用基础/原理
 - [1. sudo tee 命令的作用](#1-sudo-tee-命令的作用)
@@ -7415,8 +7416,114 @@ chmod 750 /opt/nucur/uploads
 
 ---
 
+## 21. systemd 服务启动失败 status=226/NAMESPACE ReadWritePaths 指向的目录不存在
+### 现象
+使用 systemd 将 Go 后端注册为系统服务（`chunhua.service`），unit 文件内容大致如下：
 
+```ini
+[Unit]
+Description=chunhua backend service
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
+[Service]
+Type=simple
+User=user-chunhua
+WorkingDirectory=/opt/chunhua/bin
+ExecStart=/opt/chunhua/bin/chunhua
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/chunhua/logs
+StandardOutput=journal
+StandardError=journal
+EnvironmentFile=/opt/chunhua/env/env.conf
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/opt/chunhua` 下已提前创建好 `env`、`log`、`bin`、`uploads` 等目录，`user-chunhua` 系统用户也已存在（`cut -d: -f1 /etc/passwd` 可查到）。但执行 `systemctl start chunhua` 后服务反复重启最终失败，`journalctl -u chunhua` 显示：
+
+```
+systemd[1]: Started chunhua backend service.
+systemd[1]: chunhua.service: Main process exited, code=exited, status=226/NAMESPACE
+systemd[1]: chunhua.service: Failed with result 'exit-code'.
+...（RestartSec=5 反复重启 5 次后）
+systemd[1]: chunhua.service: Start request repeated too quickly.
+systemd[1]: Failed to start chunhua backend service.
+```
+
+### 原因
+`status=226/NAMESPACE` 是 systemd **在真正执行 `ExecStart` 指定的二进制之前**，为该 unit 搭建 mount namespace（沙箱隔离）失败时返回的退出码，**与业务代码本身完全无关**。
+
+会触发 226 的都是 unit 文件里跟命名空间/挂载相关的指令，本例中即：
+
+```ini
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/chunhua/logs
+```
+
+其中 `ReadWritePaths=` 要求所指向的目录**必须已经存在**（除非路径前加 `-` 前缀，表示缺失时静默忽略），systemd 会尝试对其做 bind mount 以放开读写权限；如果源目录不存在，bind mount 建立失败，整个 namespace 搭建失败，进程还没来得及执行就以 226 退出，且不会在 journal 中给出具体缺失路径的提示，非常容易误判为程序 bug。
+
+本例的根因是**目录名对不上**：实际创建的是 `/opt/chunhua/log`（单数），而 unit 文件里 `ReadWritePaths` 写的是 `/opt/chunhua/logs`（复数），导致该目录一直不存在。
+
+### 排查方法
+1. 先用 `systemd-analyze verify` 静态校验 unit 文件，很多路径类问题能提前发现：
+   ```bash
+   systemd-analyze verify chunhua.service
+   ```
+2. 确认 `ReadWritePaths`（以及 `ReadOnlyPaths`、`InaccessiblePaths` 等同类指令）里写的路径是否真实存在：
+   ```bash
+   ls -ld /opt/chunhua/logs
+   ```
+3. 若怀疑是 SELinux 而非目录缺失导致（CentOS 默认开启），可辅助排查：
+   ```bash
+   getenforce
+   ausearch -m avc -ts recent 2>/dev/null | grep chunhua
+   ```
+
+### 解决方法
+两种方式选一，保证 unit 文件里的路径与磁盘上实际存在的目录一致即可：
+
+**方式一：创建/重命名为 unit 文件中声明的目录（推荐）**
+```bash
+mkdir -p /opt/chunhua/logs
+chown user-chunhua:user-chunhua /opt/chunhua/logs
+chmod 750 /opt/chunhua/logs
+```
+
+**方式二：修改 unit 文件路径以匹配实际目录**
+```ini
+ReadWritePaths=/opt/chunhua/log
+```
+
+修复后重新加载并启动：
+```bash
+systemctl daemon-reload
+systemctl reset-failed chunhua.service   # 清除因 StartLimitBurst 触发的失败计数
+systemctl start chunhua
+systemctl status chunhua
+journalctl -u chunhua -n 50 --no-pager
+```
+
+> 本例验证：将 `/opt/chunhua/log` 目录改名为 `/opt/chunhua/logs`（与 unit 文件 `ReadWritePaths` 保持一致）后，服务立即启动成功。
+
+### 延伸建议
+1. **`ReadWritePaths` / `ReadOnlyPaths` 等路径最好用绝对路径，且要与应用配置（如日志目录、上传目录的环境变量）保持完全一致**，避免"应用写到 A 目录、systemd 只放开了 B 目录"的隐性错位。
+2. **应用侧的相对路径配置在 systemd 场景下要格外小心**：相对路径是相对于 `WorkingDirectory` 解析的，如果 `EnvironmentFile` 里没有显式写成绝对路径，实际生效目录可能和运维人员预期的不一致，进而与 `ReadWritePaths` 对不上。建议在 `env.conf` 中始终使用绝对路径，例如：
+   ```ini
+   LOG_FILE=/opt/chunhua/logs/institution
+   UPLOAD_DIR=/opt/chunhua/uploads
+   ```
+3. **`code=exited, status=226/NAMESPACE` 系列退出码速查**：只要看到 226，第一反应应是检查 unit 文件中所有和文件系统隔离相关的指令（`ReadWritePaths`/`ReadOnlyPaths`/`InaccessiblePaths`/`TemporaryFileSystem`/`ProtectHome`/`ProtectSystem`/`PrivateTmp` 等），而不是去排查业务代码。
+
+---
 
 ## 服务器通用基础/原理
 
