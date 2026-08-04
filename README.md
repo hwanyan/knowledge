@@ -11,12 +11,12 @@
 - [6. 前端调用 gRPC 服务还是 HTTP 网关？两者有何区别？](#6-前端调用-grpc-服务还是-http-网关两者有何区别)
 - [7. grpc-gateway 路由注册机制与双端口架构](#7-grpc-gateway-路由注册机制与双端口架构)
 - [8. 契约与部署拓扑解耦与资源导向的 API 路径设计](#8-契约与部署拓扑解耦与资源导向的-api-路径设计)
-- [9. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#9-go-编译期接口实现断言var-_-iface-=-(*t)(nil))
+- [9. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）](#9-go-编译期接口实现断言)
 - [10. Go 并发编程——互斥锁、读写锁与 Redis 分布式锁](#10-go-并发编程互斥锁读写锁与-redis-分布式锁)
 
 ### 计算机网络相关
 - [1. 什么是代理和反向代理](#1-什么是代理和反向代理)
-- [2. MCP 协议的两种传输方式（SSE Transport / Streamable HTTP）](#2-mcp-协议的两种传输方式sse-transport---streamable-http)
+- [2. MCP 协议的两种传输方式（SSE Transport / Streamable HTTP）](#2-mcp-协议的两种传输方式sse-transport-streamable-http)
 - [3. 反代到后端为什么不用 HTTP/2？](#3-反代到后端为什么不用-http-2)
 - [4. 什么是 WebSocket？为什么有 HTTP 了还要用 WebSocket？](#4-什么是-websocket为什么有-http-了还要用-websocket)
 - [5. 什么是内网穿透](#5-什么是内网穿透)
@@ -36,7 +36,7 @@
 - [7. SSH 免密登录的原理](#7-ssh-免密登录的原理)
 - [8. 服务器防火墙详解](#8-服务器防火墙详解)
 - [9. PostgreSQL 安装与配置（CentOS 8）](#9-postgresql-安装与配置centos-8)
-- [10. pgvector 扩展安装（CentOS 8 + PostgreSQL 16）](#10-pgvector-扩展安装centos-8-+-postgresql-16)
+- [10. pgvector 扩展安装（CentOS 8 + PostgreSQL 16）](#10-pgvector-扩展安装centos-8-postgresql-16)
 - [11. 查看云服务器运行状态的常用命令速查](#11-查看云服务器运行状态的常用命令速查)
 - [12. journalctl 单个服务日志过多的清理与重置方法](#12-journalctl-单个服务日志过多的清理与重置方法)
 - [13. 在云服务器上把应用注册为 systemd 系统级服务](#13-在云服务器上把应用注册为-systemd-系统级服务)
@@ -48,6 +48,7 @@
 - [19. 查看云服务器内存使用情况的运维命令速查](#19-查看云服务器内存使用情况的运维命令速查)
 - [20. Linux 目录权限中 x（执行位）的作用——为什么有读写权限却无法访问目录下的文件](#20-linux-目录权限中-x执行位的作用为什么有读写权限却无法访问目录下的文件)
 - [21. systemd 服务启动失败 status=226/NAMESPACE ReadWritePaths 指向的目录不存在](#21-systemd-服务启动失败-status226namespace-readwritepaths-指向的目录不存在)
+- [22. 磁盘写满的排查流程与应急处理](#22-磁盘写满的排查流程与应急处理)
 
 ### 服务器通用基础/原理
 - [1. sudo tee 命令的作用](#1-sudo-tee-命令的作用)
@@ -1909,6 +1910,8 @@ rpc SwitchAgent(SwitchAgentRequest) returns (SwitchAgentResponse) {
 
 ---
 
+<a id="9-go-编译期接口实现断言"></a>
+
 ## 9. Go 编译期接口实现断言（`var _ Iface = (*T)(nil)`）
 ### 问题
 
@@ -2569,6 +2572,8 @@ location /static/ {
 - **反向代理**："服务器"请代理帮"服务器"接客（服务器视角）
 
 ---
+
+<a id="2-mcp-协议的两种传输方式sse-transport-streamable-http"></a>
 
 ## 2. MCP 协议的两种传输方式（SSE Transport / Streamable HTTP）
 #### 1. SSE Transport（/sse）
@@ -5915,6 +5920,8 @@ psql -U appuser -d appdb -h 127.0.0.1 -W
 
 ---
 
+<a id="10-pgvector-扩展安装centos-8-postgresql-16"></a>
+
 ## 10. pgvector 扩展安装（CentOS 8 + PostgreSQL 16）
 ### 背景
 
@@ -8465,11 +8472,286 @@ journalctl -u chunhua -n 50 --no-pager
    LOG_FILE=/opt/chunhua/logs/institution
    UPLOAD_DIR=/opt/chunhua/uploads
    ```
-3. **`code=exited, status=226/NAMESPACE` 系列退出码速查**：只要看到 226，第一反应应是检查 unit 文件中所有和文件系统隔离相关的指令（`ReadWritePaths`/`ReadOnlyPaths`/`InaccessiblePaths`/`TemporaryFileSystem`/`ProtectHome`/`ProtectSystem`/`PrivateTmp` 等），而不是去排查业务代码。
+## 22. 磁盘写满的排查流程与应急处理
+
+### 问题
+
+服务器上运行的某个任务把磁盘写满了，应该如何快速排查并恢复？
 
 ---
 
-## 服务器通用基础/原理
+### 排查流程图
+
+```mermaid
+flowchart TD
+    A[🔴 磁盘告警/写满] --> B[df -h 确认分区]
+    B --> C{已删除文件未释放？}
+    C -->|是| D[lsof | grep deleted<br/>定位占用进程PID]
+    D --> E[重启该进程<br/>或 kill -9 PID 强制释放]
+    C -->|否| F[du -sh /* 按目录排查]
+    F --> G[find 查找大文件]
+    G --> H[iotop/pidstat 定位写入进程]
+    H --> I{根因确认？}
+    I -->|是| J{可清理？}
+    J -->|是| K[清理日志/临时文件<br/>设置日志轮转]
+    J -->|否| L[扩容磁盘<br/>或迁移数据]
+    I -->|否| M[检查系统日志<br/>journalctl/tail messages]
+    M --> I
+```
+
+---
+
+### 一、首先确认磁盘状态
+
+```bash
+df -h
+```
+
+确认哪个分区（如 `/dev/vda1`）使用率达到 100%，记录挂载点（如 `/`）。这一步是起点，告诉你"哪里满了"。
+
+**关注指标：**
+
+| 分区 | 正常阈值 | 告警阈值 |
+|------|---------|---------|
+| `/` | < 80% | > 90% |
+| `/var` | < 80% | > 90% |
+| `/tmp` | < 50% | > 80% |
+| `/home` | < 90% | > 95% |
+
+---
+
+### 二、查找正在写入的大文件
+
+#### 2.1 使用 find 查找大文件（静态排查）
+
+```bash
+sudo find / -type f -size +500M -exec ls -lh {} \; 2>/dev/null | awk '{print $9, $5}' | sort -k2 -h
+```
+
+查找大于 500MB 的文件，按大小排序。这是最常用的"快照式"排查。
+
+> **进阶**：如果要查最近被修改过的大文件，加上 `-mtime`：
+> ```bash
+> sudo find /var -type f -size +100M -mtime -1 -exec ls -lh {} \; 2>/dev/null
+> ```
+> 查找 `/var` 下24小时内修改过的超过100MB的文件。
+
+#### 2.2 使用 lsof 查看打开的大文件（实时排查）
+
+```bash
+sudo lsof -w | grep -E "(REG|DIR)" | sort -k7 -rn | head -20
+```
+
+列出当前进程打开的大文件，按大小排序。如果某个文件正在被写入且持续增长，会在这里显示。
+
+---
+
+### 三、⚠️ 检查已删除但未释放空间的文件（最常见陷阱）
+
+这是**磁盘写满最隐蔽的原因**：文件被 `rm` 删除了，但某个进程仍然持有该文件的句柄，内核不会释放磁盘空间。
+
+#### 3.1 检测命令
+
+```bash
+sudo lsof | grep deleted
+# 或
+sudo lsof -w | grep '(deleted)'
+```
+
+#### 3.2 问题原理
+
+```mermaid
+sequenceDiagram
+    participant App as 应用程序
+    participant FS as 文件系统
+    participant Disk as 磁盘
+
+    App->>FS: 打开文件 /var/log/app.log (fd=3)
+    App->>FS: 持续写入...
+    Note over FS,Disk: 磁盘空间被占用
+    
+    App->>FS: rm /var/log/app.log ❌
+    Note over FS: 目录项被删除<br/>但文件 inode 仍被进程持有
+    
+    App->>FS: 继续写入 fd=3...
+    Note over Disk: 磁盘空间继续被占用<br/>但 ls 看不到这个文件！
+```
+
+**本质：** Linux 中，`rm` 只删除目录中的文件名（directory entry），文件的 inode 和数据块只有在**所有引用（硬链接数=0 且 无进程持有句柄）都释放后**才会真正回收。
+
+#### 3.3 解决方案
+
+**方案一：重启进程（推荐）**
+
+```bash
+# 查到 PID 后，重启对应服务
+sudo systemctl restart 服务名
+```
+
+**方案二：截断文件描述符（无需重启）**
+
+```bash
+# 查到 PID 和 fd 后，直接截断文件内容
+sudo truncate -s 0 /proc/PID/fd/FD号
+# 例如：sudo truncate -s 0 /proc/12345/fd/3
+```
+> 这不会影响进程写入（句柄仍然有效），但能立即释放磁盘空间。适合无法重启的关键进程。
+
+**方案三：强制释放（风险高）**
+
+```bash
+sudo kill -9 PID
+```
+> ⚠️ 仅用于非关键进程，可能丢失数据。
+
+#### 3.4 一键检测脚本
+
+```bash
+#!/bin/bash
+# 一键检测已删除但未释放的文件
+echo "=== 已删除但未释放的文件 ==="
+sudo lsof -w 2>/dev/null | grep '(deleted)' | awk '{
+    printf "PID=%-8s 进程=%-20s FD=%-6s 大小=%-10s 文件=%s\n", $2, $1, $4, $7, $9
+}'
+
+TOTAL=$(sudo lsof -w 2>/dev/null | grep '(deleted)' | awk '{sum+=$7} END {printf "%.1f MB", sum/1024/1024}')
+echo "总计占用: $TOTAL"
+```
+
+---
+
+### 四、定位正在产生大量写入的进程
+
+#### 4.1 iotop（实时磁盘IO监控）
+
+```bash
+# 安装
+sudo yum install iotop -y       # CentOS/RHEL
+sudo apt install iotop -y       # Ubuntu/Debian
+
+# 只显示有IO活动的进程
+sudo iotop -o -d 1
+```
+
+**输出解读：**
+| 列 | 含义 |
+|----|------|
+| `DISK READ` | 当前读取速率 |
+| `DISK WRITE` | 当前写入速率 ← 重点关注 |
+| `SWAPIN` | 换入比例（>0表示内存紧张） |
+| `IO>` | IO占用百分比 |
+
+#### 4.2 pidstat（无 iotop 时的替代）
+
+```bash
+# 每秒采样一次，共5次，显示磁盘IO
+sudo pidstat -d 1 5
+```
+
+输出中 `kB_wr/s` 列即每秒写入量，数值异常大的进程就是元凶。
+
+---
+
+### 五、按目录大小排查（缩小范围）
+
+```bash
+# 一级目录占用排行
+sudo du -sh /* 2>/dev/null | sort -hr | head -10
+
+# 重点关注这些目录
+sudo du -sh /var/*  2>/dev/null | sort -hr | head -5   # 日志、缓存
+sudo du -sh /tmp/*  2>/dev/null | sort -hr | head -5   # 临时文件
+sudo du -sh /opt/*  2>/dev/null | sort -hr | head -5   # 应用数据
+sudo du -sh /home/* 2>/dev/null | sort -hr | head -5   # 用户数据
+```
+
+**各目录常见占空间原因：**
+
+| 目录 | 常见原因 | 排查重点 |
+|------|---------|---------|
+| `/var/log` | 日志未轮转，或某服务疯狂打日志 | `journalctl --disk-usage` / `du -sh /var/log/*` |
+| `/tmp` | 临时文件堆积 | 可能有未清理的缓存或上传临时文件 |
+| `/var/lib/docker` | Docker镜像、容器、数据卷 | `docker system df` |
+| `/opt` | 应用数据（数据库、上传文件） | 逐层 `du -sh` 下钻 |
+| `/home` | 用户数据 | 检查是否有核心转储（core dump）文件 |
+
+---
+
+### 六、查看系统日志是否有异常
+
+```bash
+# systemd 服务日志
+sudo journalctl -u 服务名 -n 50 --no-pager
+
+# 系统日志
+sudo tail -100 /var/log/messages     # CentOS/RHEL
+sudo tail -100 /var/log/syslog       # Ubuntu/Debian
+
+# 检查日志占用的磁盘空间
+journalctl --disk-usage
+```
+
+---
+
+### 七、临时紧急处理
+
+如果磁盘已完全写满，必须立即释放空间来恢复服务：
+
+```bash
+# 1. 清理 systemd 日志（最安全，立竿见影）
+sudo journalctl --vacuum-size=200M    # 保留最近200MB
+# 或按时间清理
+sudo journalctl --vacuum-time=3d      # 保留最近3天
+
+# 2. 手动触发日志轮转
+sudo logrotate -f /etc/logrotate.conf
+
+# 3. 清理包管理器缓存
+sudo yum clean all                    # CentOS/RHEL
+sudo apt clean                        # Ubuntu/Debian
+
+# 4. 清理临时文件（谨慎）
+sudo find /tmp -type f -atime +7 -delete  # 删除7天前的临时文件
+
+# 5. Docker相关（如适用）
+docker system prune -a --volumes      # 清理未使用的镜像、容器、卷
+```
+
+> ⚠️ **注意**：`sudo rm -rf /tmp/*` 虽然能快速释放空间，但可能删除正在使用的临时文件（如 socket 文件、锁文件），建议用 `find + atime` 或针对具体目录清理。
+
+---
+
+### 八、预防措施
+
+| 措施 | 命令/方法 | 说明 |
+|------|----------|------|
+| **日志轮转** | 配置 `/etc/logrotate.d/` | 按大小或时间自动切割+压缩+删除旧日志 |
+| **磁盘监控** | 配置告警（Prometheus + node_exporter） | 使用率 > 85% 发钉钉/企微/邮件告警 |
+| **systemd 日志限制** | 编辑 `/etc/systemd/journald.conf` | 设置 `SystemMaxUse=500M` |
+| **应用日志级别** | 生产环境用 `WARN` 或 `ERROR` | 避免 `DEBUG` 级别日志撑爆磁盘 |
+| **定期巡检** | crontab 定时任务 | 每日检查 `df -h` 并通过 `du` 审计大盘 |
+| **临时目录清理** | `tmpfiles.d` 配置 | systemd 的 `systemd-tmpfiles` 自动清理 `/tmp`、`/var/tmp` |
+
+---
+
+### 九、排查速查表（总结）
+
+| 步骤 | 命令 | 目的 |
+|------|------|------|
+| ① 确认分区 | `df -h` | 知道哪个分区满了 |
+| ② 查已删未释放 | `lsof \| grep deleted` | 最常见且最隐蔽的原因 |
+| ③ 查大文件 | `find / -type f -size +500M` | 找到空间大户 |
+| ④ 查写入进程 | `iotop -o -d 1` 或 `pidstat -d 1` | 谁是元凶 |
+| ⑤ 按目录排查 | `du -sh /* \| sort -hr \| head -10` | 缩小范围，逐层下钻 |
+| ⑥ 查系统日志 | `journalctl -u 服务名 -n 50` | 确认是否有异常输出 |
+| ⑦ 紧急释放 | `journalctl --vacuum-size=200M` | 安全快速腾空间 |
+| ⑧ 事后预防 | 配置 logrotate + 监控告警 | 避免再次发生 |
+
+> **核心排查顺序：先查 `lsof | grep deleted`（已删未释放），再用 `du -sh /*` 定位大目录，最后用 `iotop` 找到持续写入的进程。**
+> 
+> 如果定位不到根因，请收集以下信息进一步分析：`df -h`、`du -sh /*` 和 `lsof -w | head -50` 的输出。
+
+---
 
 ## 1. sudo tee 命令的作用
 ### 问题
