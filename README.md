@@ -9728,6 +9728,8 @@ SELECT version();
 
 > 本文档汇总了 Agent 开发相关的知识
 
+<a id="1-Agent-和-LLM-大模型的区别是什么？"></a>
+
 ## 1. Agent 和 LLM 大模型的区别是什么？
 
 用一个通俗的类比来理解：
@@ -9765,6 +9767,8 @@ SELECT version();
 > **LLM 是 Agent 的"大脑引擎"，Agent = LLM + 工具调用 + 记忆 + 规划能力。**
 
 就像 ChatGPT 网页版是一个 LLM，而 Cursor/Claude Code 这类编程助手就是典型的 Agent——它们不仅理解你的需求，还能读文件、写代码、运行命令、自我纠错。
+
+<a id="2-Agent-的基本组成部分是怎样的？"></a>
 
 ## 2. Agent 的基本组成部分是怎样的？
 
