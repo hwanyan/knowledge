@@ -65,6 +65,7 @@
 - [4. 开发LLM驱动Agent的常用框架](#4-开发llm驱动agent的常用框架)
 - [5. RAG全链路详解](#5-rag全链路详解)
 - [6. 赋予LLM规划能力的主流方法](#6-赋予llm规划能力的主流方法)
+- [7. Agent的短期记忆与长期记忆系统设计](#7-agent的短期记忆与长期记忆系统设计)
 
 ---
 
@@ -11421,5 +11422,841 @@ flowchart TD
 5. **不要一开始就求"最复杂"**：LATS虽强，但成本和复杂度极高。大多数生产场景下，**ReAct + CoT Prompt** 已经能覆盖90%的需求。
 
 > **一句话总结**：CoT是地基——让模型"显式推理"；ToT/GoT是进阶——让模型"探索多条路"；ReAct是实战——让推理和行动交替循环。选哪个取决于你的问题有多复杂，以及你愿意付出多少Token成本。
+
+---
+
+## 7. Agent的短期记忆与长期记忆系统设计
+
+如果说"规划能力"是Agent的**大脑**，那"记忆系统"就是Agent的**海马体**——没有记忆，每次对话都像失忆症患者，什么也不记得、什么也学不会。一个真正有用的Agent必须在"短期记忆"和"长期记忆"之间建立高效的信息流转。
+
+---
+
+### 一、记忆的本质分类
+
+```mermaid
+flowchart TD
+    subgraph 人类记忆类比
+        H1["🧠 感官记忆<br/>几秒"] --> H2["📝 工作记忆<br/>几分钟"]
+        H2 -->|巩固| H3["💾 长期记忆<br/>数天到数年"]
+    end
+    subgraph Agent记忆映射
+        A1["⚡ 上下文窗口<br/>（每轮对话的输入）"] --> A2["📋 短期记忆<br/>（当前会话）"]
+        A2 -->|持久化| A3["🗄️ 长期记忆<br/>（跨会话）"]
+    end
+```
+
+| 记忆类型 | 人类类比 | Agent中的含义 | 存储时长 | 容量 | 获取速度 |
+|----------|----------|---------------|----------|------|----------|
+| **上下文窗口** | 感官记忆 | LLM一次性处理的所有token | 单次推理 | 有限（如128K tokens） | 极快 |
+| **短期记忆** | 工作记忆 | 当前会话内的对话历史、中间结果 | 单次会话 | 中等 | 快 |
+| **长期记忆** | 长期记忆 | 跨会话持久化的知识、用户偏好、经验 | 永久 | 理论上无限 | 需检索 |
+
+---
+
+### 二、短期记忆系统设计
+
+短期记忆的核心目标：**让Agent在当前会话中"记住刚才说了什么、做了什么"，避免重复提问、前后矛盾**。
+
+#### 2.1 朴素方案：全量对话历史
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 用户
+    participant A as 🤖 Agent
+    participant M as 📋 短期记忆（列表）
+    
+    U->>A: 帮我查一下北京天气
+    A->>M: [存储] user: "帮我查一下北京天气"
+    A->>A: 调用天气API
+    A->>M: [存储] assistant: "北京今天晴，25°C"
+    A->>U: 北京今天晴，25°C
+    
+    U->>A: 那明天呢？
+    A->>M: [读取] 之前问的是"北京天气"
+    A->>A: 推断：用户问的是"北京明天天气"
+    A->>U: 北京明天多云，22°C
+```
+
+**实现方式：**
+
+```go
+// Message 对话消息
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// SimpleMemory 最简单的短期记忆——切片追加
+type SimpleMemory struct {
+	messages []Message
+}
+
+func NewSimpleMemory() *SimpleMemory {
+	return &SimpleMemory{messages: make([]Message, 0)}
+}
+
+func (m *SimpleMemory) AddUserMessage(content string) {
+	m.messages = append(m.messages, Message{Role: "user", Content: content})
+}
+
+func (m *SimpleMemory) AddAssistantMessage(content string) {
+	m.messages = append(m.messages, Message{Role: "assistant", Content: content})
+}
+
+// GetContext 返回完整对话历史
+func (m *SimpleMemory) GetContext() []Message {
+	return m.messages
+}
+
+// 使用示例
+memory := NewSimpleMemory()
+memory.AddUserMessage("帮我查一下北京天气")
+// ... 调用LLM ...
+memory.AddAssistantMessage("北京今天晴，25°C")
+
+// 下一轮对话时，把完整历史传给LLM
+newMessages := append(memory.GetContext(), Message{Role: "user", Content: "那明天呢？"})
+response := llm.Chat(newMessages)
+```
+
+**问题：** 对话一长，历史消息就会**撑爆上下文窗口**，导致LLM"遗忘"早期信息或拒绝响应。
+
+#### 2.2 进阶方案：滑动窗口 + 摘要压缩
+
+```mermaid
+flowchart LR
+    Full["📜 完整对话历史<br/>（可能很长）"] --> Split{超出窗口？}
+    Split -->|否| Send["直接发送给LLM"]
+    Split -->|是| Summarize["🔧 对早期对话做摘要压缩"]
+    Summarize --> Combine["📦 摘要 + 最近N轮对话"]
+    Combine --> Send
+```
+
+```go
+// LLMClient LLM调用接口（简化示例）
+type LLMClient interface {
+	Complete(prompt string) string
+}
+
+// SlidingWindowMemory 滑动窗口 + 摘要压缩
+type SlidingWindowMemory struct {
+	fullHistory    []Message // 完整历史
+	recentTurns    []Message // 最近N轮（完整保留）
+	summary        string    // 早期历史的摘要
+	maxRecentTurns int
+	llm            LLMClient
+}
+
+func NewSlidingWindowMemory(maxRecentTurns int, llm LLMClient) *SlidingWindowMemory {
+	return &SlidingWindowMemory{
+		fullHistory:    make([]Message, 0),
+		recentTurns:    make([]Message, 0),
+		maxRecentTurns: maxRecentTurns,
+		llm:            llm,
+	}
+}
+
+func (m *SlidingWindowMemory) AddMessage(msg Message) {
+	m.fullHistory = append(m.fullHistory, msg)
+	m.recentTurns = append(m.recentTurns, msg)
+
+	// 最近对话超过阈值，把最旧的移到摘要中
+	if len(m.recentTurns) > m.maxRecentTurns*2 { // 每轮=2条消息
+		cutoff := len(m.recentTurns) - m.maxRecentTurns*2
+		oldMessages := m.recentTurns[:cutoff]
+		m.recentTurns = m.recentTurns[cutoff:]
+		// 调用LLM生成增量摘要
+		m.summary = m.generateSummary(m.summary, oldMessages)
+	}
+}
+
+func (m *SlidingWindowMemory) GetContext() []Message {
+	context := make([]Message, 0)
+	if m.summary != "" {
+		context = append(context, Message{
+			Role:    "system",
+			Content: fmt.Sprintf("历史对话摘要：%s", m.summary),
+		})
+	}
+	context = append(context, m.recentTurns...)
+	return context
+}
+
+func (m *SlidingWindowMemory) generateSummary(existingSummary string, newMessages []Message) string {
+	msgsJSON, _ := json.Marshal(newMessages)
+	prompt := fmt.Sprintf("已有摘要：%s\n\n新对话：%s\n\n请将新对话的关键信息合并到摘要中。",
+		existingSummary, string(msgsJSON))
+	return m.llm.Complete(prompt)
+}
+```
+
+#### 2.3 高级方案：结构化工作记忆
+
+不只是"记住说了什么"，而是**记住"当前在做哪一步""还需要做什么""已经得到了什么中间结果"**。
+
+```go
+// WorkingContext 结构化工作台的上下文数据
+type WorkingContext struct {
+	Goal                string            `json:"goal"`                 // 当前任务目标
+	CurrentStep         string            `json:"current_step"`         // 当前执行到哪一步
+	RemainingSteps      []string          `json:"remaining_steps"`      // 剩余步骤
+	IntermediateResults map[string]string `json:"intermediate_results"` // 中间结果 key → value
+	Observations        []string          `json:"observations"`         // 工具调用的观察结果
+	Constraints         []string          `json:"constraints"`          // 用户施加的约束
+	Errors              []string          `json:"errors"`               // 执行中的错误记录
+}
+
+// StructuredWorkingMemory 模仿人类做复杂任务时的"工作台"——把信息分类存储
+type StructuredWorkingMemory struct {
+	Context WorkingContext
+}
+
+func NewStructuredWorkingMemory() *StructuredWorkingMemory {
+	return &StructuredWorkingMemory{
+		Context: WorkingContext{
+			IntermediateResults: make(map[string]string),
+			RemainingSteps:      make([]string, 0),
+			Observations:        make([]string, 0),
+			Constraints:         make([]string, 0),
+			Errors:              make([]string, 0),
+		},
+	}
+}
+
+// ToPrompt 把结构化记忆转成LLM可读的文本
+func (m *StructuredWorkingMemory) ToPrompt() string {
+	errorsStr := "无"
+	if len(m.Context.Errors) > 0 {
+		errorsStr = strings.Join(m.Context.Errors, "；")
+	}
+
+	return fmt.Sprintf(`
+当前任务: %s
+当前步骤: %s
+剩余步骤: %v
+中间结果: %v
+用户约束: %v
+历史错误: %s
+`, m.Context.Goal, m.Context.CurrentStep,
+		m.Context.RemainingSteps, m.Context.IntermediateResults,
+		m.Context.Constraints, errorsStr)
+}
+```
+
+**三种短期记忆方案对比：**
+
+| 方案 | 实现复杂度 | Token效率 | 信息丢失 | 适用场景 |
+|------|-----------|-----------|----------|----------|
+| 全量历史 | ⭐ 极简 | ❌ 差 | ✅ 无丢失 | 短对话（<10轮） |
+| 滑动窗口+摘要 | ⭐⭐⭐ 中等 | ✅ 好 | ⚠️ 早期细节丢失 | 中等长度对话 |
+| 结构化工作记忆 | ⭐⭐⭐⭐ 较复杂 | ✅ 极好 | ✅ 关键信息保留 | 复杂多步任务 |
+
+---
+
+### 三、长期记忆系统设计
+
+长期记忆的核心目标：**跨会话持久化，让Agent"下次见面还能认出你""从经验中持续学习"**。
+
+#### 3.1 长期记忆的三种形态
+
+```mermaid
+flowchart TD
+    LM["🗄️ 长期记忆"] --> E["📖 情节记忆<br/>（Episodic）"]
+    LM --> S["🧠 语义记忆<br/>（Semantic）"]
+    LM --> P["⚙️ 程序记忆<br/>（Procedural）"]
+    
+    E --> E1["过去对话的完整记录<br/>"上次你帮我改了登录页的样式""]
+    S --> S1["抽象知识和用户画像<br/>"用户偏好React+TypeScript""]
+    P --> P1["学到的行为模式<br/>"遇到404错误先检查路由配置""]
+```
+
+| 记忆形态 | 存储内容 | 示例 | 检索方式 |
+|----------|----------|------|----------|
+| **情节记忆** | 具体事件的完整记录 | "2025年8月5日，用户要求修改了`Login.tsx`的按钮颜色为#1890ff" | 按时间/关键词检索 |
+| **语义记忆** | 抽象化的知识、事实、偏好 | "用户是前端工程师，使用React+TS技术栈，偏好antd组件库" | 语义向量检索 |
+| **程序记忆** | 学到的工作流、经验教训 | "修改antd主题色应该改ConfigProvider而非单独组件" | 规则匹配/案例检索 |
+
+#### 3.2 技术实现架构
+
+```mermaid
+flowchart TD
+    subgraph 写入路径
+        Sess["💬 当前会话结束"] --> Extract["🔍 记忆提取器<br/>（LLM驱动的关键信息抽取）"]
+        Extract --> Embed["📐 向量化<br/>（Embedding模型）"]
+        Extract --> Store_Profile["👤 用户画像库<br/>（关系型DB / Redis）"]
+        Embed --> Store_Vector["🧬 向量数据库<br/>（Milvus/Qdrant/Chroma）"]
+        Extract --> Store_Event["📜 事件日志<br/>（PostgreSQL/MongoDB）"]
+    end
+    
+    subgraph 读取路径
+        NewQ["🆕 新会话开始"] --> Query["🔍 检索相关记忆"]
+        Query -->|用户偏好| Profile["读取用户画像"]
+        Query -->|语义相似| Vector["向量检索相关经验"]
+        Query -->|时间相关| Event["查询近期事件"]
+        Profile --> Inject["📥 注入到当前会话<br/>（System Prompt + 上下文）"]
+        Vector --> Inject
+        Event --> Inject
+    end
+```
+
+**完整架构代码示例：**
+
+```go
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// ========================================
+// 接口定义：解耦底层数据库实现
+// ========================================
+
+// RelationalDB 关系型数据库抽象接口
+type RelationalDB interface {
+	Insert(table string, doc any) error
+	Query(table string, filter map[string]any) ([]map[string]any, error)
+	GetUserProfile(userID string) (*UserProfile, error)
+	UpsertUserProfile(profile *UserProfile) error
+	LogSession(userID string, messages []Message) error
+}
+
+// VectorDB 向量数据库抽象接口
+type VectorDB interface {
+	Insert(collection string, vector []float64, metadata map[string]any) error
+	Search(collection string, vector []float64, topK int, filter map[string]any) ([]VectorResult, error)
+}
+
+// VectorResult 向量检索结果
+type VectorResult struct {
+	Content  string
+	Metadata map[string]any
+	Score    float64
+}
+
+// Embedder Embedding模型接口
+type Embedder interface {
+	Encode(text string) ([]float64, error)
+}
+
+// ========================================
+// UserProfile 用户画像
+// ========================================
+type UserProfile struct {
+	UserID       string   `json:"user_id"`
+	TechStack    []string `json:"tech_stack"`
+	Preferences  []string `json:"preferences"`
+	Projects     []ProjectInfo `json:"projects"`
+	Facts        []string `json:"facts"`
+	PendingTasks []string `json:"pending_tasks"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type ProjectInfo struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+// ========================================
+// LongTermMemory 长期记忆系统——三库联动架构
+// ========================================
+type LongTermMemory struct {
+	vectorDB    VectorDB    // Milvus/Qdrant/Chroma
+	relationalDB RelationalDB // PostgreSQL/Redis
+	embedder    Embedder    // Embedding模型
+	llm         LLMClient   // 用于提取关键信息
+}
+
+func NewLongTermMemory(vectorDB VectorDB, relationalDB RelationalDB, embedder Embedder, llm LLMClient) *LongTermMemory {
+	return &LongTermMemory{
+		vectorDB:    vectorDB,
+		relationalDB: relationalDB,
+		embedder:    embedder,
+		llm:         llm,
+	}
+}
+
+// ====== 写入侧 ======
+
+// StoreSession 每次会话结束后调用
+func (m *LongTermMemory) StoreSession(userID string, messages []Message, metadata map[string]any) error {
+	// 1. 情节记忆：完整保存对话事件
+	event := map[string]any{
+		"user_id":   userID,
+		"timestamp": time.Now().Format(time.RFC3339),
+		"messages":  messages,
+		"metadata":  metadata,
+	}
+	if err := m.relationalDB.Insert("session_events", event); err != nil {
+		return fmt.Errorf("保存事件日志失败: %w", err)
+	}
+
+	// 2. 语义记忆：用LLM提取关键信息、更新用户画像
+	extracted, err := m.extractKeyInfo(messages)
+	if err != nil {
+		return fmt.Errorf("提取关键信息失败: %w", err)
+	}
+	if err := m.updateUserProfile(userID, extracted); err != nil {
+		return fmt.Errorf("更新用户画像失败: %w", err)
+	}
+
+	// 3. 将关键对话片段向量化存储（用于语义检索）
+	keyMoments := m.extractKeyMoments(messages)
+	for _, moment := range keyMoments {
+		embedding, err := m.embedder.Encode(moment.Content)
+		if err != nil {
+			continue // 单条失败不影响整体
+		}
+		m.vectorDB.Insert("agent_memories", embedding, map[string]any{
+			"user_id":   userID,
+			"type":      moment.Type,
+			"content":   moment.Content,
+			"timestamp": time.Now().Format(time.RFC3339),
+		})
+	}
+
+	return nil
+}
+
+// RecordLesson 记录学到的经验教训（程序记忆）
+func (m *LongTermMemory) RecordLesson(userID, context, mistake, fix string) error {
+	lesson := map[string]any{
+		"user_id":   userID,
+		"context":   context,   // 什么场景
+		"mistake":   mistake,   // 犯了什么错
+		"fix":       fix,       // 怎么修的
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+	return m.relationalDB.Insert("lessons_learned", lesson)
+}
+
+// ====== 读取侧 ======
+
+// RelevantMemories 相关记忆集合
+type RelevantMemories struct {
+	Profile        *UserProfile
+	Semantic       []VectorResult
+	RecentEvents   []map[string]any
+	RelatedLessons []LearnedLesson
+}
+
+type LearnedLesson struct {
+	Context string
+	Mistake string
+	Fix     string
+}
+
+// GetRelevantMemories 新会话开始时，检索相关记忆注入上下文
+func (m *LongTermMemory) GetRelevantMemories(userID, query string, topK int) (*RelevantMemories, error) {
+	result := &RelevantMemories{}
+
+	// 1. 读取用户画像
+	profile, err := m.relationalDB.GetUserProfile(userID)
+	if err == nil {
+		result.Profile = profile
+	}
+
+	// 2. 语义检索相关记忆
+	queryVec, err := m.embedder.Encode(query)
+	if err != nil {
+		return result, nil // 非致命错误，返回已有数据
+	}
+	semanticResults, err := m.vectorDB.Search("agent_memories", queryVec, topK, map[string]any{"user_id": userID})
+	if err == nil {
+		result.Semantic = semanticResults
+	}
+
+	// 3. 查询近7天事件
+	recentEvents, err := m.relationalDB.Query("session_events", map[string]any{
+		"user_id": userID,
+		"timestamp": map[string]any{
+			"$gte": time.Now().AddDate(0, 0, -7).Format(time.RFC3339),
+		},
+	})
+	if err == nil {
+		result.RecentEvents = recentEvents
+	}
+
+	return result, nil
+}
+
+// FormatForPrompt 把检索到的记忆格式化为LLM可读的System Prompt
+func (m *LongTermMemory) FormatForPrompt(memories *RelevantMemories) string {
+	var parts []string
+
+	if memories.Profile != nil {
+		profileJSON, _ := json.MarshalIndent(memories.Profile, "", "  ")
+		parts = append(parts, fmt.Sprintf("## 用户画像\n%s", string(profileJSON)))
+	}
+
+	if len(memories.Semantic) > 0 {
+		var items []string
+		for _, r := range memories.Semantic {
+			items = append(items, fmt.Sprintf("- %s", r.Content))
+		}
+		parts = append(parts, fmt.Sprintf("## 相关历史\n%s", strings.Join(items, "\n")))
+	}
+
+	if len(memories.RelatedLessons) > 0 {
+		var items []string
+		for _, l := range memories.RelatedLessons {
+			items = append(items, fmt.Sprintf("- 场景：%s → 问题：%s → 解决：%s", l.Context, l.Mistake, l.Fix))
+		}
+		parts = append(parts, fmt.Sprintf("## 经验教训\n%s", strings.Join(items, "\n")))
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+// ====== 内部辅助 ======
+
+// KeyMoment 对话中的"关键时刻"
+type KeyMoment struct {
+	Type    string // decision / action
+	Content string
+}
+
+func (m *LongTermMemory) extractKeyInfo(messages []Message) (*UserProfile, error) {
+	msgsJSON, _ := json.Marshal(messages)
+	prompt := fmt.Sprintf(`从以下对话中提取用户的关键信息（JSON格式）：
+{
+  "tech_stack": ["使用的技术"],
+  "preferences": ["偏好"],
+  "projects": [{"name": "项目名", "role": "角色"}],
+  "facts": ["用户提及的个人信息/事实"],
+  "pending_tasks": ["未完成的任务"]
+}
+
+对话内容：
+%s`, string(msgsJSON))
+
+	response := m.llm.Complete(prompt)
+	var profile UserProfile
+	if err := json.Unmarshal([]byte(response), &profile); err != nil {
+		return nil, fmt.Errorf("解析LLM提取结果失败: %w", err)
+	}
+	return &profile, nil
+}
+
+func (m *LongTermMemory) extractKeyMoments(messages []Message) []KeyMoment {
+	var moments []KeyMoment
+	for _, msg := range messages {
+		if strings.Contains(msg.Content, "决定") || strings.Contains(msg.Content, "重要") {
+			moments = append(moments, KeyMoment{Type: "decision", Content: msg.Content})
+		}
+		if strings.Contains(msg.Content, "修改") || strings.Contains(msg.Content, "创建") {
+			moments = append(moments, KeyMoment{Type: "action", Content: msg.Content})
+		}
+	}
+	return moments
+}
+
+func (m *LongTermMemory) updateUserProfile(userID string, extracted *UserProfile) error {
+	if extracted == nil {
+		return nil
+	}
+	// 实际实现：读取现有画像 → 合并 → 写回
+	existing, err := m.relationalDB.GetUserProfile(userID)
+	if err != nil {
+		return m.relationalDB.UpsertUserProfile(extracted)
+	}
+	// 合并策略：extracted 中的非空字段覆盖 existing
+	if len(extracted.TechStack) > 0 {
+		existing.TechStack = extracted.TechStack
+	}
+	if len(extracted.Preferences) > 0 {
+		existing.Preferences = extracted.Preferences
+	}
+	// ... 其余字段同理
+	existing.UpdatedAt = time.Now()
+	return m.relationalDB.UpsertUserProfile(existing)
+}
+```
+
+---
+
+### 四、记忆更新策略
+
+记忆不是"存进去就完事了"，需要**持续更新**才能保持准确。
+
+```mermaid
+flowchart TD
+    NewInfo["🆕 新信息到来"] --> Check{与已有记忆冲突？}
+    Check -->|不冲突| Add["补充到记忆"]
+    Check -->|有冲突| Resolve["解决冲突"]
+    Resolve --> Override["用户明确纠正 → 覆盖旧记忆"]
+    Resolve --> Merge["自然演变 → 合并新旧信息"]
+    Resolve --> Mark["无法判断 → 标记为'待确认'"]
+    
+    Stale["⏳ 定期巡检"] --> Decay["记忆衰减"]
+    Decay --> Remove["删除长期未使用的记忆"]
+    Decay --> Demote["降级为'低频记忆'，减少检索优先级"]
+```
+
+**记忆更新的关键原则：**
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| **用户纠正优先** | 用户明确说"不对""改了"，立即覆盖 | "我不再用React了，现在用Vue"→ 更新画像 |
+| **时效衰减** | 越久远的记忆，检索权重越低 | 6个月前的偏好 vs 上周的偏好 |
+| **来源标注** | 每段记忆标注来源和时间，方便追溯 | `{source: "user_stated", time: "2025-08-01"}` |
+| **冲突检测** | 新信息与旧记忆矛盾时，不自动覆盖，而是向用户确认 | "您之前说偏好React，现在提到Vue项目，是否需要更新偏好？" |
+
+---
+
+### 五、可借助的外部工具与技术一览
+
+| 类别 | 工具/技术 | 用途 | 推荐场景 |
+|------|-----------|------|----------|
+| **向量数据库** | **Chroma** | 轻量级向量存储，Python原生，适合原型 | 小规模、快速验证 |
+| | **Qdrant** | 高性能向量数据库，支持过滤+向量混合查询 | 中等规模生产环境 |
+| | **Milvus** | 企业级分布式向量数据库 | 大规模生产环境 |
+| | **Pinecone**（云服务） | 全托管向量数据库，免运维 | 不想管基础设施 |
+| | **Weaviate** | 自带向量化+混合搜索 | 需要开箱即用的方案 |
+| **关系型/KV数据库** | **PostgreSQL** | 存储用户画像、事件日志、经验教训 | 结构化记忆存储 |
+| | **Redis** | 高速KV存储，适合用户画像热数据缓存 | 低延迟读取场景 |
+| | **MongoDB** | 文档型存储，灵活Schema适合情节记忆 | 对话事件存储 |
+| **Embedding模型** | **OpenAI text-embedding-3** | 通用文本向量化 | 通用场景 |
+| | **BGE-M3**（BAAI） | 开源、支持中英文、8192 token | 中文场景、私有化部署 |
+| | **Cohere Embed** | 多语言、支持压缩向量 | 多语言场景 |
+| **记忆专用框架** | **Mem0** | 开源记忆层，自动提取+去重+更新用户记忆 | 快速接入长期记忆 |
+| | **LangChain Memory** | `ConversationBufferMemory`、`ConversationSummaryMemory`等即用组件 | LangChain生态内 |
+| | **MemGPT / Letta** | 给LLM加上"操作系统级"记忆管理（虚拟上下文） | 超长对话、Agent自治 |
+| | **Zep** | 开源记忆服务，内置摘要+向量检索+事实提取 | 需要独立记忆服务 |
+| | **LangMem**（LangChain新） | 从对话中提取语义记忆并管理记忆生命周期 | LangGraph/LangChain项目 |
+| **图谱数据库** | **Neo4j** | 用知识图谱存储实体间关系 | 需要结构化知识的Agent |
+| **全文检索引擎** | **Elasticsearch** | 关键词全文搜索历史对话 | 需要精确匹配历史对话 |
+
+---
+
+### 六、各工具组合方案推荐
+
+```mermaid
+flowchart TD
+    Start{"项目阶段？"} -->|原型验证| Plan1["Chroma + OpenAI Embedding<br/>+ LangChain Memory<br/>最快半小时搭好记忆系统"]
+    Start -->|中小规模生产| Plan2["PostgreSQL（画像+事件）<br/>+ Qdrant（语义检索）<br/>+ Mem0（自动记忆管理）"]
+    Start -->|大规模企业级| Plan3["Milvus（向量海量存储）<br/>+ PostgreSQL + Redis（热缓存）<br/>+ Elasticsearch（全文搜索）<br/>+ Neo4j（知识图谱）"]
+```
+
+**方案一：最小可行产品（30分钟搭建）**
+
+```go
+// 最小可行产品（30分钟搭建）
+// 使用 chromadb-go + OpenAI Embedding 快速验证
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	chroma "github.com/amikos-tech/chroma-go"
+	openai "github.com/sashabaranov/go-openai"
+)
+
+// 短期记忆：使用 LangChain Go 的摘要缓存
+// 实际项目中可引入 langchaingo 包，此处展示核心逻辑
+
+func setupQuickMemory() {
+	// 长期记忆：Chroma 向量库
+	client := chroma.NewClient("http://localhost:8000")
+	collection, _ := client.CreateCollection(context.Background(), "agent_memory", nil)
+
+	// 存储记忆
+	remember := func(userID, text string) error {
+		_, err := collection.Add(context.Background(), nil, nil,
+			[]string{text},                     // documents
+			[]map[string]any{{"user_id": userID}}, // metadatas
+			[]string{fmt.Sprintf("%s_%d", userID, time.Now().Unix())}, // ids
+		)
+		return err
+	}
+
+	// 检索记忆
+	recall := func(userID, query string, n int32) ([]string, error) {
+		results, err := collection.Query(context.Background(),
+			[]string{query}, // query texts
+			n,               // n_results
+			nil,             // where (可选的条件过滤，chroma-go 通过 metadata 过滤)
+			nil,             // where_document
+			nil,             // include
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(results.Documents) == 0 {
+			return nil, nil
+		}
+		return results.Documents[0], nil
+	}
+
+	_ = remember
+	_ = recall
+}
+```
+
+**方案二：生产级（半天搭建）**
+
+```go
+// 生产级记忆系统的伪架构
+// 使用 PostgreSQL + Redis + Qdrant + Mem0（异步）
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/go-redis/redis/v8"
+	qdrant "github.com/qdrant/go-client/qdrant"
+)
+
+type ProductionMemorySystem struct {
+	pg     *PostgreSQL     // 用户画像、事件日志
+	redis  *redis.Client   // 热数据缓存
+	qdrant *qdrant.Client  // 语义检索
+	mem0   *Mem0Client     // 自动记忆管理
+}
+
+func NewProductionMemorySystem() *ProductionMemorySystem {
+	return &ProductionMemorySystem{
+		pg:     NewPostgreSQL(),
+		redis:  redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
+		qdrant: qdrant.NewClient(&qdrant.Config{Host: "localhost", Port: 6334}),
+		mem0:   NewMem0Client(),
+	}
+}
+
+// OnSessionStart 会话开始时的记忆加载
+func (s *ProductionMemorySystem) OnSessionStart(ctx context.Context, userID, query string) (string, error) {
+	// 1. 从 Redis 读用户画像（1ms级）
+	profileKey := fmt.Sprintf("profile:%s", userID)
+	profileJSON, err := s.redis.Get(ctx, profileKey).Result()
+	if err == redis.Nil {
+		// Cache miss → 从 PG 读
+		profile, err := s.pg.GetUserProfile(ctx, userID)
+		if err == nil {
+			data, _ := json.Marshal(profile)
+			s.redis.SetEX(ctx, profileKey, data, 1*time.Hour)
+			profileJSON = string(data)
+		}
+	}
+
+	// 2. 从 Qdrant 检索语义相似记忆
+	relevant, err := s.qdrant.Search(ctx, &qdrant.SearchPoints{
+		CollectionName: "agent_memories",
+		Vector:         getEmbedding(query), // 省略 embedding 调用
+		Filter: &qdrant.Filter{
+			Must: []*qdrant.Condition{
+				qdrant.NewMatchKeyword("user_id", userID),
+			},
+		},
+		Limit: qdrant.PtrOf(uint64(5)),
+	})
+	_ = relevant // 实际使用中合并到上下文
+
+	// 3. 从 Mem0 获取最新的记忆
+	recent, err := s.mem0.Search(ctx, query, userID)
+	_ = recent
+
+	return s.formatContext(profileJSON, relevant, recent), err
+}
+
+// OnSessionEnd 会话结束时的记忆持久化
+func (s *ProductionMemorySystem) OnSessionEnd(ctx context.Context, userID string, messages []Message) error {
+	// 1. Mem0 自动提取关键事实并去重
+	if err := s.mem0.Add(ctx, messages, userID); err != nil {
+		return err
+	}
+
+	// 2. 存事件日志到 PG
+	if err := s.pg.LogSession(ctx, userID, messages); err != nil {
+		return err
+	}
+
+	// 3. 使 Redis 缓存失效（等待下次重建）
+	profileKey := fmt.Sprintf("profile:%s", userID)
+	return s.redis.Del(ctx, profileKey).Err()
+}
+
+func (s *ProductionMemorySystem) formatContext(profileJSON string, relevant any, recent any) string {
+	return fmt.Sprintf("用户画像：%s\n相关记忆：%v\n最近记忆：%v", profileJSON, relevant, recent)
+}
+
+// ====== 接口桩定义 ======
+
+type PostgreSQL struct{}
+
+func NewPostgreSQL() *PostgreSQL { return &PostgreSQL{} }
+func (p *PostgreSQL) GetUserProfile(ctx context.Context, userID string) (any, error) {
+	return nil, nil
+}
+func (p *PostgreSQL) LogSession(ctx context.Context, userID string, messages []Message) error {
+	return nil
+}
+
+type Mem0Client struct{}
+
+func NewMem0Client() *Mem0Client { return &Mem0Client{} }
+func (m *Mem0Client) Search(ctx context.Context, query, userID string) (any, error) {
+	return nil, nil
+}
+func (m *Mem0Client) Add(ctx context.Context, messages []Message, userID string) error {
+	return nil
+}
+
+func getEmbedding(text string) []float64 { return nil }
+```
+
+---
+
+### 七、记忆系统的核心设计原则
+
+```mermaid
+flowchart LR
+    subgraph 设计原则
+        P1["🎯 最小必要原则<br/>只记有用的，不记垃圾"]
+        P2["🔄 时效驱动<br/>新信息权重 > 旧信息"]
+        P3["🔒 用户主权<br/>用户可以查看/删除/修正记忆"]
+        P4["📊 分层检索<br/>热数据缓存 → 向量语义 → 全文精确"]
+        P5["🧹 自动清理<br/>定期去重、合并、删除过期记忆"]
+    end
+```
+
+| 原则 | 为什么重要 | 反例 |
+|------|-----------|------|
+| **最小必要** | 记忆不是越多越好，噪音记忆会降低检索准确率 | 记住了"用户某天说了一句'今天天气真好'" |
+| **时效驱动** | 3个月前的偏好可能已经过时 | 记住了用户初学时的技术栈，但他早已切换 |
+| **用户主权** | 隐私和信任的底线 | 用户说"忘记这件事"，Agent做不到 |
+| **分层检索** | 不同记忆需要不同检索策略，单一检索会遗漏 | 只用向量检索，精确的关键词匹配反而找不准 |
+| **自动清理** | 无人维护的记忆系统会变成"垃圾堆" | 半年后向量库里有10万条早已无用的碎片 |
+
+---
+
+### 八、短期记忆 vs 长期记忆：串联工作流
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 用户
+    participant SM as 📋 短期记忆
+    participant LM as 🗄️ 长期记忆
+    participant LLM as 🧠 LLM
+    
+    U->>SM: "帮我写一个登录页"
+    SM->>LM: 查询相关记忆
+    LM-->>SM: [画像]偏好React+TS [历史]上次改了按钮颜色
+    SM->>LLM: System: 用户偏好React+TS<br/>Context: 登录页需求 + 历史上下文
+    LLM-->>SM: 生成的代码
+    SM-->>U: 登录页代码（已包含用户偏好）
+    
+    Note over SM,LM: 会话结束
+    
+    SM->>LM: 存储本次会话
+    LM->>LM: 提取关键信息：<br/>1. 创建了LoginPage.tsx<br/>2. 使用了antd Form组件<br/>3. 用户对样式做了额外调整
+    LM->>LM: 更新用户画像：<br/>前端组件偏好：antd
+```
+
+---
+
+> **一句话总结**：短期记忆让Agent**这一轮不健忘**（滑动窗口+摘要），长期记忆让Agent**下一次不陌生**（三库联动：画像库+向量库+事件库）。工具选型上，原型用Chroma+LangChain快速验证，生产用Qdrant+PostgreSQL+Redis构建稳定系统，长期记忆管理可借助Mem0/Zep等专业框架减少重复造轮子。
 
 ---
