@@ -56,6 +56,8 @@
 - [2. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）](#2-为什么-psql-在--usr--下，而-mysql-在--usr-local--下fhs-与安装方式)
 
 ### 数据库相关
+- [MongoDB 数据库详解](#mongodb-数据库详解)
+- [MongoDB 常用命令速查](#mongodb-常用命令速查)
 - [PostgreSQL 常用命令速查](#postgresql-常用命令速查)
 
 ### Agent相关
@@ -9726,6 +9728,317 @@ SELECT version();
 
 ---
 
+## MongoDB 数据库详解
+
+MongoDB 是一个开源的、**面向文档**的 NoSQL 数据库，是最流行、最知名的非关系型数据库之一。你可以把它想象成一个**超级强大的 JSON 数据库**。
+
+### 📄 核心概念：文档与集合
+
+| 概念 | MongoDB | 关系型数据库类比 |
+|------|--------|----------------|
+| **文档（Document）** | 最基本的数据单元，类似 JSON 对象 | 行（Row） |
+| **集合（Collection）** | 文档的容器 | 表（Table） |
+
+一个典型的 MongoDB 文档示例：
+
+```json
+{
+  "_id": ObjectId("507f1f77bcf86cd799439011"),
+  "name": "Alice",
+  "birthdate": ISODate("1990-01-01T00:00:00Z"),
+  "address": {
+    "street": "123 Main St",
+    "city": "Springfield",
+    "state": "IL"
+  },
+  "hobbies": ["reading", "hiking", "coding"]
+}
+```
+
+### 🚀 核心特性
+
+1. **灵活的文档模型（无模式/Schema-less）**：同一集合中的文档可以有完全不同的字段，随时增删改字段无需 `ALTER TABLE`，适合业务快速迭代。
+
+2. **强大的查询与分析能力**：支持 CRUD、聚合管道（Aggregation Pipeline，多阶段数据处理）、地理空间查询、全文搜索。
+
+3. **原生水平扩展（分片 Sharding）**：通过增加普通服务器分散数据和负载，处理 PB 级海量数据和高并发。
+
+4. **高可用性（副本集 Replica Set）**：主节点处理写入，从节点处理读取/热备，主节点故障时自动选举新主。
+
+5. **多文档 ACID 事务**（4.0+）：支持原子性、一致性、隔离性、持久性事务，满足金融、订单等强一致性场景。
+
+### 🆚 与关系型数据库对比
+
+| 特性 | MongoDB | MySQL 等关系型数据库 |
+|------|---------|---------------------|
+| 数据模型 | 面向文档（类 JSON） | 面向表（行+列） |
+| 模式 | 动态/灵活 | 静态/刚性，需预先定义 |
+| 扩展方式 | 原生水平扩展（分片） | 主要垂直扩展，水平扩展复杂 |
+| 关联查询 | 内嵌文档或引用，不推荐 JOIN | JOIN 多表关联 |
+
+### 🎯 典型应用场景
+
+- **内容管理系统**：文章、商品目录等结构多变的数据
+- **实时分析与日志处理**：高速写入大量日志和事件数据
+- **物联网（IoT）**：海量设备数据的高速写入和存储
+- **游戏应用**：玩家信息、装备、积分等灵活数据结构
+- **移动/社交应用**：地理空间索引实现"附近的人"等功能
+- **微服务架构**：每个服务独立数据库，去中心化数据管理
+
+### ⚠️ 注意事项
+
+- 多文档事务有性能开销，尤其在分片集群中
+- 性能高度依赖内存，热数据需能放入内存
+- 生产级分片集群运维复杂度高于单机数据库
+
+---
+
+## MongoDB 常用命令速查
+
+### 数据库操作
+
+```bash
+# 查看所有数据库
+show dbs
+
+# 切换/创建数据库（use 后执行插入操作才真正创建）
+use mydb
+
+# 查看当前数据库
+db
+
+# 删除当前数据库
+db.dropDatabase()
+```
+
+### 集合操作
+
+```bash
+# 查看当前库所有集合
+show collections
+
+# 创建集合
+db.createCollection("users")
+
+# 删除集合
+db.users.drop()
+```
+
+### 文档 CRUD
+
+```bash
+# --- 插入 ---
+# 插入单条
+db.users.insertOne({ name: "Alice", age: 25, city: "Beijing" })
+
+# 插入多条
+db.users.insertMany([
+  { name: "Bob", age: 30, city: "Shanghai" },
+  { name: "Carol", age: 28, city: "Shenzhen" }
+])
+
+# --- 查询 ---
+# 查询所有
+db.users.find()
+
+# 美化输出
+db.users.find().pretty()
+
+# 条件查询
+db.users.find({ age: { $gt: 25 } })
+
+# 多条件 AND
+db.users.find({ age: { $gt: 25 }, city: "Beijing" })
+
+# OR 条件
+db.users.find({ $or: [{ age: { $lt: 25 } }, { city: "Shanghai" }] })
+
+# 查询第一条
+db.users.findOne({ name: "Alice" })
+
+# 限制返回数量
+db.users.find().limit(5)
+
+# 跳过前 N 条
+db.users.find().skip(10).limit(5)
+
+# 排序（1 升序，-1 降序）
+db.users.find().sort({ age: -1 })
+
+# 只返回指定字段（1 包含，0 排除）
+db.users.find({}, { name: 1, age: 1, _id: 0 })
+
+# 模糊查询（正则）
+db.users.find({ name: /li/ })
+
+# 数组包含查询
+db.users.find({ hobbies: "reading" })
+
+# 判断字段存在
+db.users.find({ email: { $exists: true } })
+
+# 统计数量
+db.users.countDocuments({ age: { $gt: 25 } })
+
+# 去重
+db.users.distinct("city")
+
+# --- 更新 ---
+# 更新单条
+db.users.updateOne(
+  { name: "Alice" },
+  { $set: { age: 26, city: "Hangzhou" } }
+)
+
+# 更新多条
+db.users.updateMany(
+  { age: { $lt: 30 } },
+  { $inc: { age: 1 } }
+)
+
+# 替换整条文档
+db.users.replaceOne(
+  { name: "Alice" },
+  { name: "Alice", age: 27, city: "Nanjing", email: "alice@example.com" }
+)
+
+# upsert（存在则更新，不存在则插入）
+db.users.updateOne(
+  { name: "David" },
+  { $set: { age: 35 } },
+  { upsert: true }
+)
+
+# --- 删除 ---
+# 删除单条
+db.users.deleteOne({ name: "Bob" })
+
+# 删除多条
+db.users.deleteMany({ age: { $lt: 25 } })
+
+# 清空集合
+db.users.deleteMany({})
+```
+
+### 常用查询操作符
+
+```bash
+# 比较操作符
+{ age: { $gt: 25 } }       # 大于
+{ age: { $gte: 25 } }      # 大于等于
+{ age: { $lt: 25 } }       # 小于
+{ age: { $lte: 25 } }      # 小于等于
+{ age: { $ne: 25 } }       # 不等于
+{ age: { $in: [25, 30] } } # 在列表中
+{ age: { $nin: [25, 30] } }# 不在列表中
+
+# 逻辑操作符
+{ $and: [{ age: 25 }, { city: "Beijing" }] }
+{ $or:  [{ age: 25 }, { city: "Beijing" }] }
+{ $not: { age: { $gt: 25 } } }
+```
+
+### 更新操作符
+
+```bash
+$set         # 设置字段值
+$unset       # 删除字段
+$inc         # 数值递增/递减
+$rename      # 重命名字段
+$push        # 数组尾部添加元素
+$pull        # 数组移除匹配元素
+$addToSet    # 数组添加元素（去重）
+```
+
+### 索引操作
+
+```bash
+# 创建单字段索引
+db.users.createIndex({ name: 1 })
+
+# 创建复合索引
+db.users.createIndex({ name: 1, age: -1 })
+
+# 创建唯一索引
+db.users.createIndex({ email: 1 }, { unique: true })
+
+# 创建 TTL 索引（文档过期自动删除，单位秒）
+db.logs.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 })
+
+# 查看集合的索引
+db.users.getIndexes()
+
+# 删除指定索引
+db.users.dropIndex("name_1")
+
+# 删除所有索引（_id 除外）
+db.users.dropIndexes()
+```
+
+### 聚合管道
+
+```bash
+# 分组统计
+db.orders.aggregate([
+  { $group: { _id: "$status", count: { $sum: 1 }, total: { $sum: "$amount" } } }
+])
+
+# 过滤 + 分组 + 排序
+db.orders.aggregate([
+  { $match: { status: "completed" } },
+  { $group: { _id: "$customerId", total: { $sum: "$amount" } } },
+  { $sort: { total: -1 } },
+  { $limit: 10 }
+])
+
+# 常用聚合阶段
+# $match    - 过滤
+# $group    - 分组
+# $sort     - 排序
+# $limit    - 限制数量
+# $skip     - 跳过
+# $project  - 字段映射
+# $lookup   - 左外连接（类似 SQL JOIN）
+# $unwind   - 展开数组
+```
+
+### 数据备份与恢复
+
+```bash
+# 导出单库
+mongodump --db mydb --out /backup/
+
+# 导入单库
+mongorestore --db mydb /backup/mydb/
+
+# 导出为 JSON
+mongoexport --db mydb --collection users --out users.json
+
+# 导入 JSON
+mongoimport --db mydb --collection users --file users.json
+```
+
+### 实用管理命令
+
+```bash
+# 查看数据库统计信息
+db.stats()
+
+# 查看集合统计信息
+db.users.stats()
+
+# 查看当前操作
+db.currentOp()
+
+# 终止操作
+db.killOp(opid)
+
+# 查看副本集状态
+rs.status()
+
+# 查看分片状态
+sh.status()
+```
 
 ---
 
