@@ -66,6 +66,7 @@
 - [5. RAG全链路详解](#5-rag全链路详解)
 - [6. 赋予LLM规划能力的主流方法](#6-赋予llm规划能力的主流方法)
 - [7. Agent的短期记忆与长期记忆系统设计](#7-agent的短期记忆与长期记忆系统设计)
+- [8. LLM如何学会调用外部API或工具（Function Calling）](#8-llm如何学会调用外部api或工具function-calling)
 
 ---
 
@@ -12258,5 +12259,638 @@ sequenceDiagram
 ---
 
 > **一句话总结**：短期记忆让Agent**这一轮不健忘**（滑动窗口+摘要），长期记忆让Agent**下一次不陌生**（三库联动：画像库+向量库+事件库）。工具选型上，原型用Chroma+LangChain快速验证，生产用Qdrant+PostgreSQL+Redis构建稳定系统，长期记忆管理可借助Mem0/Zep等专业框架减少重复造轮子。
+
+---
+
+## 8. LLM如何学会调用外部API或工具（Function Calling）
+
+让LLM"开口说话"只需要给它文字，但让LLM"动手做事"——查天气、发邮件、操作数据库、调用API——就需要一套全新的机制。这就是 **Function Calling（函数调用）**，也被称为 **Tool Use（工具使用）**。它的核心思想并不神秘，本质是：**把工具列表注入System Prompt，让LLM输出JSON描述"我想调哪个函数、传什么参数"，再由外部程序真正执行这个调用**。
+
+---
+
+### 一、一句话看清本质
+
+```mermaid
+flowchart LR
+    subgraph "普通对话"
+        Q1["北京今天天气怎么样？"] --> LLM1["🧠 LLM"]
+        LLM1 --> A1["抱歉，我的知识截止于2023年..."]
+    end
+    
+    subgraph "Function Calling"
+        Q2["北京今天天气怎么样？"] --> LLM2["🧠 LLM"]
+        LLM2 --> JSON["(name:'get_weather', args:(city:'北京'))"]
+        JSON --> Exec["🔧 外部程序<br/>执行 get_weather('北京')"]
+        Exec --> Result["北京今天晴，25°C"]
+        Result --> LLM3["🧠 LLM<br/>把结果转成自然语言"]
+        LLM3 --> A2["北京今天晴，25°C ✅"]
+    end
+```
+
+**核心逻辑：LLM不执行工具，它只是说"我想调用某个函数"，真正的执行由你的程序完成。** LLM本质上是一个"意图识别 + 参数提取器"。
+
+---
+
+### 二、LLM是如何"学会"这个能力的？
+
+#### 2.1 训练层面：从指令微调到工具调用微调
+
+```mermaid
+flowchart TD
+    Pretrain["基础预训练<br/>（海量文本，无工具概念）"] --> SFT["指令微调 SFT<br/>学会'遵循指令'"]
+    SFT --> FuncTrain["工具调用微调<br/>专门训练数据"]
+    
+    FuncTrain --> Data1["训练样本 A：<br/>用户问'北京天气'<br/>→ 模型输出 get_weather(city='北京')"]
+    FuncTrain --> Data2["训练样本 B：<br/>用户问'发邮件给张三'<br/>→ 模型输出 send_email(to='zhangsan@xx.com', body='...')"]
+    
+    Data1 --> RLHF["RLHF 对齐<br/>（拒绝不安全调用）"]
+    Data2 --> RLHF
+```
+
+**训练数据长什么样？** 以OpenAI格式为例：
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是一个助手，可以调用以下函数：\n- get_weather(city: string): 查询城市天气\n- send_email(to: string, subject: string): 发送邮件"
+    },
+    {
+      "role": "user",
+      "content": "帮我查一下北京天气，然后给张三发邮件告诉他"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_001",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"北京\"}"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+关键点：**训练时，模型学会的不是"怎么查天气"，而是"什么时候该说get_weather、city参数填什么"**。这是一种元能力——理解工具描述→判断何时触发→抽取正确参数。
+
+#### 2.2 推理层面：三段式循环
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 用户
+    participant App as 🔧 你的程序
+    participant LLM as 🧠 LLM
+    participant Tool as 🌐 外部API
+    
+    User->>App: "北京今天天气怎么样？"
+    App->>LLM: System: 你有以下工具...<br/>User: 北京今天天气怎么样？
+    LLM-->>App: finish_reason=tool_calls<br/>{"name":"get_weather","args":{"city":"北京"}}
+    App->>Tool: curl weather.com/api?city=北京
+    Tool-->>App: {"temp":25, "condition":"晴"}
+    App->>LLM: [历史对话] + tool_result: {"temp":25, "condition":"晴"}
+    LLM-->>App: finish_reason=stop<br/>"北京今天晴，25°C"
+    App-->>User: "北京今天晴，25°C ✅"
+```
+
+**三段式循环：**
+
+| 阶段 | 谁在工作 | 做什么 |
+|------|----------|--------|
+| **① 决策** | LLM | 判断是否需要工具、选哪个、填什么参数 → 输出JSON |
+| **② 执行** | 你的程序 | 解析JSON、调用真实API、拿到结果 |
+| **③ 生成** | LLM | 接收结果、综合所有信息、生成自然语言回答 |
+
+---
+
+### 三、三种主流实现方式对比
+
+```mermaid
+flowchart TD
+    Approach["三种让LLM调用函数的方式"] --> Native["① 原生 Function Calling<br/>（OpenAI/Mistral/通义千问等）"]
+    Approach --> Prompt["② Prompt 注入<br/>（ReAct / 通用方案）"]
+    Approach --> FineTune["③ 微调专用模型<br/>（Functionary / Gorilla等）"]
+```
+
+#### 方式一：原生 Function Calling（推荐）
+
+**原理：** 模型厂商在API层面内置了`tools`参数，模型经过专门训练，能理解JSON Schema并输出结构化JSON。
+
+```go
+// OpenAI 原生 Function Calling 示例
+import openai "github.com/sashabaranov/go-openai"
+
+func callWithTools(query string) (*openai.ChatCompletionResponse, error) {
+	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+
+	resp, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+		Model: "gpt-4o",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: "user", Content: "北京今天天气怎么样？"},
+		},
+		Tools: []openai.Tool{
+			{
+				Type: "function",
+				Function: &openai.FunctionDefinition{
+					Name:        "get_weather",
+					Description: "查询指定城市的实时天气",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"city": map[string]any{
+								"type":        "string",
+								"description": "城市名称，如'北京'、'上海'",
+							},
+						},
+						"required": []string{"city"},
+					},
+				},
+			},
+		},
+	})
+	return &resp, err
+}
+
+// 处理 tool_calls
+msg := resp.Choices[0].Message
+if len(msg.ToolCalls) > 0 {
+	tc := msg.ToolCalls[0]
+	if tc.Function.Name == "get_weather" {
+		// 解析参数
+		var args struct{ City string }
+		json.Unmarshal([]byte(tc.Function.Arguments), &args)
+		// 调用真实API
+		result := realWeatherAPI(args.City)
+		// 把结果传回LLM做第二轮对话
+		// ...
+	}
+}
+```
+
+**支持原生 Function Calling 的模型一览：**
+
+| 厂商 | 模型 | 特性 |
+|------|------|------|
+| **OpenAI** | gpt-4o、gpt-4o-mini、gpt-3.5-turbo | 最早推出、最成熟、支持并行调用 |
+| **Anthropic** | Claude 3.5 Sonnet/Haiku | 叫"Tool Use"，支持复杂JSON Schema |
+| **Google** | Gemini 1.5 Pro/Flash | 支持函数声明，也支持"自动决定用哪个" |
+| **Mistral** | Mistral Large、Mixtral 8x22B | 原生支持function calling |
+| **通义千问** | qwen-max、qwen-plus | 支持function call，中文场景优化 |
+| **DeepSeek** | deepseek-chat | 支持function calling |
+| **GLM** | glm-4 | 支持工具调用 |
+
+#### 方式二：Prompt 注入 + ReAct 模式（通用方案）
+
+**原理：** 把工具描述作为System Prompt的一部分注入，要求LLM按照特定格式（如JSON或特殊标记）输出调用意图，然后由外部程序解析。
+
+**核心 Prompt 模板：**
+
+```text
+你是一个智能助手，可以调用以下工具：
+
+## 可用工具
+
+### get_weather
+描述：查询指定城市的实时天气
+参数：
+- city (string, 必填): 城市名称
+
+### send_email
+描述：发送邮件
+参数：
+- to (string, 必填): 收件人邮箱
+- subject (string, 必填): 邮件主题
+- body (string, 必填): 邮件正文
+
+---
+
+当需要使用工具时，你必须严格按以下格式输出，不要输出其他内容：
+
+<tool_call>
+{"name": "函数名", "arguments": {"参数1": "值1"}}
+</tool_call>
+
+当不需要调用工具时，直接回答用户问题。
+
+用户问题：{user_query}
+```
+
+```go
+// Prompt注入方式的工具调用解析器
+type ToolCall struct {
+	Name      string
+	Arguments map[string]any
+}
+
+func ParseToolCall(response string) (*ToolCall, error) {
+	re := regexp.MustCompile(`<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>`)
+	matches := re.FindStringSubmatch(response)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("未找到工具调用标记")
+	}
+
+	var tc struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(matches[1]), &tc); err != nil {
+		return nil, fmt.Errorf("解析工具调用JSON失败: %w", err)
+	}
+
+	return &ToolCall{Name: tc.Name, Arguments: tc.Arguments}, nil
+}
+
+// 工具执行器（安全沙箱）
+type ToolExecutor struct {
+	tools map[string]func(args map[string]any) (string, error)
+}
+
+func (e *ToolExecutor) Register(name string, fn func(map[string]any) (string, error)) {
+	e.tools[name] = fn
+}
+
+func (e *ToolExecutor) Execute(call *ToolCall) (string, error) {
+	fn, ok := e.tools[call.Name]
+	if !ok {
+		return "", fmt.Errorf("未知工具: %s", call.Name)
+	}
+	return fn(call.Arguments)
+}
+```
+
+| 对比维度 | 原生 Function Calling | Prompt 注入 |
+|----------|----------------------|-------------|
+| **准确性** | ⭐⭐⭐⭐⭐ 专训+约束解码 | ⭐⭐⭐ 依赖Prompt质量 |
+| **格式可靠性** | 极高，API保证合法JSON | 中等，可能格式错误 |
+| **兼容性** | 仅限支持该特性的模型 | 任何模型都能用 |
+| **开发成本** | 低，SDK内置 | 中，需自己解析 |
+| **适用场景** | 生产环境 | 原型/不支持的模型 |
+
+#### 方式三：微调专用工具调用模型
+
+**原理：** 如果用的开源模型不支持原生function calling，可以自己构造工具调用数据集做SFT微调。
+
+**代表性项目：**
+
+| 项目 | 特点 |
+|------|------|
+| **Gorilla**（UC Berkeley） | 专门微调Llama调用API，收录1600+ API |
+| **Functionary** | 开源，训练后可精确输出工具调用JSON |
+| **ToolLLM**（清华） | 使用ChatGPT生成工具使用数据训练LLaMA |
+| **NexusRaven** | 从代码生成角度训练工具调用能力 |
+
+```go
+// 微调数据生成流水线（简化示例）
+// 核心思路：用GPT-4作为"教师"，生成(用户问题, 工具调用JSON)训练对
+
+type TrainingSample struct {
+	Instruction string `json:"instruction"` // 工具定义 + 用户问题
+	Output      string `json:"output"`       // 期望的JSON输出
+}
+
+func GenerateTrainingData(apiSchemas []APISchema) []TrainingSample {
+	prompt := fmt.Sprintf(`你是一个工具调用专家。给定以下API定义和用户问题，
+输出应该调用的函数和参数的JSON格式...
+
+可用的API：
+%s`, formatSchemas(apiSchemas))
+	// 调用教师模型批量生成训练对...
+}
+```
+
+---
+
+### 四、进阶技巧：让工具调用更可靠
+
+#### 4.1 并行工具调用
+
+当用户问题"北京和上海今天天气怎么样？"，模型可以同时返回两个`tool_calls`：
+
+```go
+// OpenAI 支持 parallel_tool_calls
+resp, _ := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	Model:       "gpt-4o",
+	Messages:    messages,
+	Tools:       tools,
+	ParallelToolCalls: true, // 开启并行
+})
+
+// 可能同时收到两个 tool_calls
+// call_1: get_weather(city="北京")
+// call_2: get_weather(city="上海")
+// → 用 goroutine 并发执行，再汇总结果传给LLM
+```
+
+#### 4.2 强制调用 vs 自主决策
+
+| 模式 | tool_choice 参数 | 行为 |
+|------|-----------------|------|
+| **auto**（默认） | `"auto"` | LLM自己决定要不要调工具 |
+| **强制调用** | `{"type": "function", "function": {"name": "xxx"}}` | 必须调指定函数 |
+| **禁止调用** | `"none"` | 不调任何工具，纯文本回答 |
+| **要求调用** | `"required"` | 必须调某个工具（不限哪个） |
+
+```go
+// 强制调用示例：数据提取场景必须返回结构化JSON
+resp, _ := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	Model:    "gpt-4o",
+	Messages: messages,
+	Tools:    []openai.Tool{extractPersonTool},
+	ToolChoice: &openai.ToolChoice{
+		Type: "function",
+		Function: openai.ToolFunction{Name: "extract_person"},
+	},
+})
+```
+
+#### 4.3 JSON Mode vs Function Calling
+
+很多人混淆这两个特性：
+
+| 特性 | JSON Mode | Function Calling |
+|------|-----------|------------------|
+| **做了什么** | 强制LLM输出合法JSON | 定义函数签名+让LLM决策调用 |
+| **适用场景** | 结构化数据提取（如简历解析） | 动态工具调用（如查天气） |
+| **是否定义工具** | 否 | 是 |
+| **LLM是否决策** | 否（必须输出JSON） | 是（可选择不调用） |
+
+```go
+// JSON Mode：让LLM输出结构化数据
+resp, _ := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	Model: "gpt-4o",
+	Messages: []openai.ChatCompletionMessage{
+		{Role: "system", Content: "你是简历解析器，将简历提取为JSON。输出必须是合法JSON。"},
+		{Role: "user", Content: "张三，5年Go开发经验，曾在字节跳动工作..."},
+	},
+	ResponseFormat: &openai.ChatCompletionResponseFormat{
+		Type: "json_object", // 强制JSON输出
+	},
+})
+```
+
+#### 4.4 流式输出中的工具调用
+
+```go
+// 处理流式 tool_calls（chunk 拼接）
+stream, _ := client.CreateChatCompletionStream(ctx, request)
+var toolCallAccumulator map[int]*openai.ToolCall // index → 累积的tool_call
+
+for {
+	chunk, err := stream.Recv()
+	if err == io.EOF {
+		break
+	}
+	for _, delta := range chunk.Choices[0].Delta.ToolCalls {
+		idx := delta.Index
+		if _, ok := toolCallAccumulator[idx]; !ok {
+			toolCallAccumulator[idx] = &openai.ToolCall{
+				Index: idx,
+				ID:    *delta.ID,
+				Type:  delta.Type,
+				Function: openai.FunctionCall{
+					Name:      *delta.Function.Name,
+					Arguments: "",
+				},
+			}
+		}
+		// 累积 arguments（流式输出中 arguments 是分片的）
+		toolCallAccumulator[idx].Function.Arguments += delta.Function.Arguments
+	}
+}
+// 全部接收完毕后执行工具调用
+```
+
+---
+
+### 五、安全与可靠性保障
+
+```mermaid
+flowchart TD
+    LLM["🧠 LLM 输出的 tool_call"] --> Validate{参数校验}
+    Validate -->|不合法| Reject["❌ 拒绝执行<br/>返回错误给LLM重试"]
+    Validate -->|合法| Auth{权限检查}
+    Auth -->|无权限| Deny["🚫 权限拒绝"]
+    Auth -->|有权限| Limit{频率限制}
+    Limit -->|超限| Throttle["⏳ 限流"]
+    Limit -->|通过| Sandbox["🔒 沙箱执行"]
+    Sandbox --> Log["📝 审计日志"]
+    Log --> Return["✅ 返回结果"]
+```
+
+**关键防护措施：**
+
+```go
+// 安全的工具执行器
+type SecureToolExecutor struct {
+	tools       map[string]ToolHandler
+	rateLimiter *RateLimiter
+	auditLog    *AuditLogger
+}
+
+type ToolHandler struct {
+	Fn           func(args map[string]any) (string, error)
+	Validate     func(args map[string]any) error // 参数校验
+	RequireAuth  bool                             // 是否需要身份验证
+	MaxArgsSize  int                              // 最大参数大小
+}
+
+func (e *SecureToolExecutor) Execute(ctx context.Context, userID string, call *ToolCall) (string, error) {
+	handler, ok := e.tools[call.Name]
+	if !ok {
+		e.auditLog.Record(ctx, userID, call.Name, "UNKNOWN_TOOL", "denied")
+		return "", fmt.Errorf("未知工具: %s", call.Name)
+	}
+
+	// 1. 参数校验
+	if handler.Validate != nil {
+		if err := handler.Validate(call.Arguments); err != nil {
+			e.auditLog.Record(ctx, userID, call.Name, "VALIDATION_FAILED", "denied")
+			return "", fmt.Errorf("参数校验失败: %w", err)
+		}
+	}
+
+	// 2. 频率限制
+	if !e.rateLimiter.Allow(userID, call.Name) {
+		e.auditLog.Record(ctx, userID, call.Name, "RATE_LIMITED", "denied")
+		return "", fmt.Errorf("操作过于频繁，请稍后再试")
+	}
+
+	// 3. 执行
+	result, err := handler.Fn(call.Arguments)
+	status := "success"
+	if err != nil {
+		status = "failed"
+	}
+	e.auditLog.Record(ctx, userID, call.Name, status, "allowed")
+	return result, err
+}
+```
+
+| 防护层 | 目的 | 实现手段 |
+|--------|------|----------|
+| **参数校验** | 防止非法参数导致崩溃或注入 | JSON Schema 校验、白名单 |
+| **权限检查** | 防止越权操作（如删除他人数据） | 检查userID是否有权限 |
+| **频率限制** | 防止滥用（无限循环调用） | 令牌桶/滑动窗口 |
+| **白名单** | 只允许调用预先定义的工具 | 不在白名单的函数直接拒绝 |
+| **审计日志** | 所有工具调用可追溯 | 记录谁、什么时候、调了什么、结果如何 |
+| **超时控制** | 防止工具调用卡死 | context.WithTimeout |
+
+---
+
+### 六、进阶：多步工具调用与工具链编排
+
+现实中的复杂任务往往不是"调一个工具就完"，而是需要**多步骤、有依赖关系**的工具链：
+
+```mermaid
+sequenceDiagram
+    participant User as 👤
+    participant LLM as 🧠
+    participant Search as 🔍 搜索
+    participant Weather as 🌤️ 天气
+    
+    User->>LLM: "查一下北京天气，如果下雨，帮我搜'北京室内景点'"
+    LLM->>Weather: get_weather(city="北京")
+    Weather-->>LLM: {"condition": "中雨", "temp": 22}
+    LLM->>LLM: 判断：下雨 → 需要搜索室内景点
+    LLM->>Search: web_search(query="北京室内景点推荐")
+    Search-->>LLM: [故宫、国家博物馆、798...]
+    LLM-->>User: "北京今天中雨22°C，推荐你去故宫、国家博物馆..."
+```
+
+**Go 实现多步工具调用循环：**
+
+```go
+// 多轮工具调用循环
+func AgentLoop(ctx context.Context, userQuery string, tools []openai.Tool, executor *SecureToolExecutor) (string, error) {
+	messages := []openai.ChatCompletionMessage{
+		{Role: "user", Content: userQuery},
+	}
+	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+
+	const maxIterations = 10 // 防止无限循环
+	for i := 0; i < maxIterations; i++ {
+		resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+			Model:    "gpt-4o",
+			Messages: messages,
+			Tools:    tools,
+		})
+		if err != nil {
+			return "", err
+		}
+
+		choice := resp.Choices[0]
+
+		// 没有工具调用 → 得到最终答案
+		if choice.FinishReason == openai.FinishReasonStop {
+			return choice.Message.Content, nil
+		}
+
+		// 有工具调用 → 执行并追加结果
+		if len(choice.Message.ToolCalls) > 0 {
+			// 把assistant的tool_calls消息加入历史
+			messages = append(messages, choice.Message)
+
+			// 并发执行所有工具调用
+			type toolResult struct {
+				idx    int
+				id     string
+				output string
+				err    error
+			}
+			resultCh := make(chan toolResult, len(choice.Message.ToolCalls))
+
+			for idx, tc := range choice.Message.ToolCalls {
+				go func(idx int, tc openai.ToolCall) {
+					var args map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+						resultCh <- toolResult{idx: idx, id: tc.ID, err: err}
+						return
+					}
+					output, err := executor.Execute(ctx, "user_id", &ToolCall{Name: tc.Function.Name, Arguments: args})
+					resultCh <- toolResult{idx: idx, id: tc.ID, output: output, err: err}
+				}(idx, tc)
+			}
+
+			// 收集结果并追加到消息历史
+			results := make([]toolResult, len(choice.Message.ToolCalls))
+			for range choice.Message.ToolCalls {
+				r := <-resultCh
+				results[r.idx] = r
+			}
+			for _, r := range results {
+				content := r.output
+				if r.err != nil {
+					content = fmt.Sprintf("执行失败: %v", r.err)
+				}
+				messages = append(messages, openai.ChatCompletionMessage{
+					Role:       "tool",
+					Content:    content,
+					ToolCallID: r.id,
+				})
+			}
+		}
+	}
+
+	return "", fmt.Errorf("达到最大迭代次数 %d，任务未完成", maxIterations)
+}
+```
+
+---
+
+### 七、主流框架中的 Function Calling 支持
+
+| 框架 | 支持方式 | 特点 |
+|------|----------|------|
+| **LangChain（Python/Go）** | `@tool`装饰器声明工具，自动生成JSON Schema | 最成熟，工具生态最丰富 |
+| **LangGraph** | 工具调用作为图的节点 | 适合复杂的多步Agent编排 |
+| **CrewAI** | 角色级别的工具绑定 | 多Agent协作场景 |
+| **AutoGen** | `register_function`注册工具 | 微软出品，对话式编程 |
+| **Semantic Kernel** | Plugin 体系 | 微软出品，.NET/Python/Java |
+| **Eino（字节跳动）** | Graph + Tool 节点 | Go生态，高性能 |
+| **Dify** | 可视化配置工具 | 低代码，拖拽式 |
+
+**Go 生态中的 Function Calling 库对比：**
+
+```go
+// 方案一：直接使用 OpenAI SDK
+import openai "github.com/sashabaranov/go-openai"
+
+// 方案二：使用 Eino（字节跳动开源Go Agent框架）
+import "github.com/cloudwego/eino/components/tool"
+
+// 方案三：使用 langchaingo（LangChain Go 实现）
+import "github.com/tmc/langchaingo/tools"
+```
+
+---
+
+### 八、核心要点总结
+
+```mermaid
+flowchart TD
+    Key["🔑 LLM工具调用的本质"] --> K1["LLM不执行工具<br/>它只输出'意图+参数'的JSON"]
+    Key --> K2["三段式循环<br/>决策→执行→生成"]
+    Key --> K3["训练数据教会模型<br/>'何时调用+参数怎么填'"]
+    Key --> K4["安全执行在外部<br/>参数校验+权限+限流+审计"]
+```
+
+| 要点 | 说明 |
+|------|------|
+| **本质** | LLM是"意图识别器+参数提取器"，不是"工具执行器" |
+| **实现** | 原生API（推荐）> Prompt注入（通用）> 微调专用模型（定制） |
+| **流程** | 三段式循环：LLM决策JSON → 程序执行API → LLM生成回答 |
+| **可靠性** | JSON Schema严格定义参数类型和约束，错误时让LLM重试 |
+| **安全** | 白名单+参数校验+权限检查+频率限制+审计日志——五层防护 |
+| **多步调用** | 通过消息历史累积实现Agent循环，最多10轮防止无限循环 |
+| **并行调用** | 无依赖的工具调用可并发执行，大幅提升响应速度 |
+| **选型建议** | 生产用OpenAI/Claude原生Function Calling；原型用Prompt注入；特殊需求考虑微调 |
+
+> **一句话总结**：LLM不是用"手"调用API的，它用"嘴"说出一段JSON，你的程序听到后替它去执行。整个机制的本质是：**把工具定义注入Prompt → 模型输出结构化调用意图 → 外部程序安全执行 → 结果回传给模型生成回答**。这个三段式循环，是当今所有Agent框架的基石。
 
 ---
