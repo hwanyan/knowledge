@@ -25,6 +25,7 @@
 ### 服务器应用部署
 - [1. 在服务器上编译基于 go 实现的后端代码并部署的流程](#1-在服务器上编译基于-go-实现的后端代码并部署的流程)
 - [2. 在服务器上编译基于 vue 实现的前端代码并部署的流程](#2-在服务器上编译基于-vue-实现的前端代码并部署的流程)
+- [3. GitHub 的 Webhook 触发 Jenkins 任务](#3-github-的-webhook-触发-jenkins-任务)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -3986,6 +3987,163 @@ chmod +x deploy.sh
 | 刷新页面 404 | 确认 `try_files $uri $uri/ /index.html` 配置正确 |
 | 构建内存不足 | 使用 `NODE_OPTIONS=--max-old-space-size=4096 npm run build` |
 | 权限问题 | 确认 `/var/www/agently-vue` 目录属主为 `www-data` |
+
+---
+
+
+
+## 3. GitHub 的 Webhook 触发 Jenkins 任务
+
+### 问题
+如何实现"开发人员把代码 push 到 GitHub 后，Jenkins 自动拉取最新代码并触发构建 / 部署任务"？
+
+### 解答
+
+#### 一、整体流程概览
+
+一句话概括：**GitHub 在代码推送后主动给 Jenkins 发一个 HTTP 通知（Webhook），Jenkins 收到通知后自动拉代码、跑构建、做部署。**
+
+```mermaid
+sequenceDiagram
+    participant Dev as 开发者
+    participant GH as GitHub 仓库
+    participant JH as Jenkins 服务器
+    participant Svr as 目标部署服务器
+
+    Dev->>GH: 1. git push（推送代码）
+    GH->>JH: 2. 发送 Webhook（POST /github-webhook/）
+    JH->>JH: 3. 校验 Secret / 匹配 Job
+    JH->>GH: 4. 拉取最新代码（git clone/pull）
+    JH->>JH: 5. 执行构建、测试、打包
+    JH->>Svr: 6. 上传产物并部署 / 重启服务
+    Svr-->>Dev: 7. 构建结果通知（邮件/IM）
+```
+
+#### 二、为什么需要 Webhook（对比轮询）
+
+| 方式 | 原理 | 优缺点 |
+| :--- | :--- | :--- |
+| **轮询（Poll SCM）** | Jenkins 每隔一段时间（如 `*/5 * * * *`）主动问 GitHub"有没有新提交" | 简单，但实时性差、浪费请求 |
+| **Webhook（推送触发）** | GitHub 一有 push 就主动通知 Jenkins | 实时、精准、省资源，推荐 ✅ |
+
+#### 三、前置准备
+
+1. **Jenkins 服务可被 GitHub 访问**：GitHub 需要能访问到 Jenkins 的 Webhook 地址，因此 Jenkins 要么有公网 IP / 域名，要么使用内网穿透（如 ngrok、frp、cpolar）暴露到公网。
+2. **安装必要插件**（Manage Jenkins → Plugins）：
+   - `Git plugin`：拉取 Git 代码。
+   - `GitHub Integration Plugin`（新版）或 `GitHub Plugin`（旧版）：提供 `/github-webhook/` 端点与 hook 触发。
+   - `Credentials Plugin`：管理 GitHub 凭据（Token / SSH Key）。
+3. **准备一个 GitHub 访问凭据**：
+   - 私有仓库推荐用 **Personal Access Token**（Settings → Developer settings → Personal access tokens）。
+   - 也可以使用 **SSH Deploy Key**。
+
+#### 四、Jenkins 侧配置
+
+**1. 添加 GitHub 凭据**
+
+进入 `Manage Jenkins → Credentials → System → Global credentials → Add Credentials`：
+
+- Kind：`Username with password`（用户名填 GitHub 用户名，密码填 Access Token）或 `SSH Username with private key`。
+- ID：自定义，例如 `github-token`。
+
+**2. 新建 Job 并配置源码管理**
+
+新建一个 `Freestyle project`（或 `Pipeline`），在 **源码管理** 中选择 `Git`：
+
+```text
+Repository URL    : https://github.com/你的用户名/你的仓库.git
+Credentials       : github-token（上一步创建的凭据）
+Branches to build : */main
+```
+
+**3. 开启 GitHub Hook 触发**
+
+在 **构建触发器** 中勾选：
+
+```text
+☑ GitHub hook trigger for GITScm polling
+```
+
+> 说明：勾选此项后，Jenkins 会在收到 `/github-webhook/` 的 POST 请求时，自动判断该推送是否匹配当前 Job 的仓库与分支，匹配则触发构建。**不需要**再配置轮询 `Poll SCM`。
+
+**4.（可选）配置构建步骤与部署脚本**
+
+在 **Build Steps** 中添加构建命令，例如：
+
+```bash
+# 后端 Go 项目
+go build -o myapp main.go
+
+# 或前端 Vue 项目
+npm install && npm run build
+```
+
+以及部署命令（scp / ssh 到目标服务器）：
+
+```bash
+scp myapp ubuntu@your_server_ip:/opt/myapp/bin/
+ssh ubuntu@your_server_ip 'sudo systemctl restart myapp'
+```
+
+#### 五、GitHub 侧配置
+
+进入仓库 `Settings → Webhooks → Add webhook`，填写：
+
+| 配置项 | 填写内容 | 说明 |
+| :--- | :--- | :--- |
+| **Payload URL** | `https://你的jenkins域名/github-webhook/` | Jenkins 暴露的 Webhook 端点，**结尾斜杠不能少** |
+| **Content type** | `application/json` | 新版 Jenkins 推荐使用 JSON |
+| **Secret** | 自定义密钥（与 Jenkins 一致） | 用于 HMAC 签名校验，防止伪造请求 |
+| **Which events** | `Just the push event` | 只在 push 时触发；也可按需选择 `Let me select individual events` |
+
+保存后，GitHub 会先发一个 `ping` 测试事件，若 Jenkins 返回 `200`，说明链路已打通（绿色 ✓）。
+
+#### 六、完整触发流程（逐步拆解）
+
+1. 开发者本地执行 `git push`，代码提交到 GitHub 远程仓库。
+2. GitHub 检测到 push 事件，向配置的 `Payload URL` 发送一个 HTTP `POST` 请求，请求体为包含本次提交信息的 JSON（分支、提交者、commit hash、变更文件等）。
+3. 请求头中带有 `X-Hub-Signature-256`（或 `X-Hub-Signature`）字段，值为使用配置的 Secret 对请求体计算的 HMAC-SHA256 签名。
+4. Jenkins 的 `github-webhook` 端点收到请求：
+   - 校验 Secret 签名是否一致，不一致则拒绝（返回 401/403）。
+   - 解析 JSON，提取仓库地址与分支信息。
+5. Jenkins 遍历所有开启了 `GitHub hook trigger for GITScm polling` 的 Job，找到仓库 + 分支匹配的 Job。
+6. 匹配的 Job 被加入构建队列，Jenkins 执行：
+   - `git fetch/pull` 拉取最新代码；
+   - 执行构建触发器里配置的构建步骤（编译、测试、打包）；
+   - 执行构建后步骤（上传产物、SSH 部署、重启服务、发通知等）。
+7. 构建完成，Jenkins 将结果写入日志，并可配置邮件、企业微信 / 飞书 / 钉钉等通知开发人员。
+
+#### 七、Secret 校验原理（安全关键）
+
+GitHub 使用 **HMAC-SHA256** 对请求体签名，Header 示例：
+
+```http
+POST /github-webhook/ HTTP/1.1
+X-GitHub-Event: push
+X-Hub-Signature-256: sha256=7b2f1c...
+```
+
+Jenkins 端校验逻辑（伪代码）：
+
+```text
+实际签名 = sha256(secret + 原始请求体)
+期望签名 = 请求头中的 X-Hub-Signature-256 去掉 "sha256=" 前缀
+比较两者是否相等（防时序攻击应使用恒定时间比较）
+```
+
+正确配置 Secret 后，只有知道密钥的人（GitHub 与 Jenkins）才能构造合法请求，从而防止恶意第三方伪造 Webhook 触发非法构建。
+
+#### 八、常见问题排查
+
+| 问题 | 可能原因与解决 |
+| :--- | :--- |
+| Webhook 返回 404 | Payload URL 少了结尾 `/`，应为 `/github-webhook/` |
+| Webhook 返回 403 / 签名校验失败 | Secret 与 Jenkins 配置不一致 |
+| 收不到触发 | 未勾选 `GitHub hook trigger for GITScm polling`；或分支不匹配 |
+| 收到请求但不构建 | 仓库地址 / 分支配置与推送的不一致，检查 Job 的 SCM 配置 |
+| 私有仓库拉取失败 | Credentials 配置错误或 Token 权限不足（需勾选 `repo` 权限） |
+| 内网 Jenkins 收不到 | 需使用内网穿透（ngrok / frp）暴露公网地址 |
+| 构建产物部署失败 | 检查 Jenkins 执行用户是否有目标服务器 SSH 权限 |
 
 ---
 
