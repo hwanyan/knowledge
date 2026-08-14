@@ -25,7 +25,8 @@
 ### 服务器应用部署
 - [1. 在服务器上编译基于 go 实现的后端代码并部署的流程](#1-在服务器上编译基于-go-实现的后端代码并部署的流程)
 - [2. 在服务器上编译基于 vue 实现的前端代码并部署的流程](#2-在服务器上编译基于-vue-实现的前端代码并部署的流程)
-- [3. GitHub 的 Webhook 触发 Jenkins 任务](#3-github-的-webhook-触发-jenkins-任务)
+- [3. Jenkins 安装与后端服务部署流水线配置](#3-jenkins-安装与后端服务部署流水线配置)
+- [4. GitHub 的 Webhook 触发 Jenkins 任务](#4-github-的-webhook-触发-jenkins-任务)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -3992,7 +3993,284 @@ chmod +x deploy.sh
 
 
 
-## 3. GitHub 的 Webhook 触发 Jenkins 任务
+## 3. Jenkins 安装与后端服务部署流水线配置
+
+### 问题
+如何在 CentOS 8 服务器上安装 Jenkins，并配置一条后端服务的构建部署流水线，实现"拉代码 → 构建 → 部署 → 重启服务"的自动化？
+
+### 解答
+
+本小节分为三部分：**① Jenkins 安装（CentOS 8）**、**② 后端服务部署流水线配置**、**③ GitHub Webhook Secret 配置**。
+
+---
+
+### 一、Jenkins 安装流程（CentOS 8）
+
+#### 1. 修复 yum 源（CentOS 8 已 EOL）
+
+**原因**：CentOS 8 已于 2021 年底停止维护，官方源（`mirrorlist.centos.org`）已不可用，导致 `dnf update` 和 `dnf install` 无法下载元数据。
+
+**操作**：将源切换为阿里云镜像（国内更快）。
+
+```bash
+sudo tee /etc/yum.repos.d/CentOS-Base.repo << 'EOF'
+[baseos]
+name=CentOS-8 - BaseOS - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/8.5.2111/BaseOS/$basearch/os/
+gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+
+[appstream]
+name=CentOS-8 - AppStream - mirrors.aliyun.com
+baseurl=https://mirrors.aliyun.com/centos/8.5.2111/AppStream/$basearch/os/
+gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-Official
+EOF
+
+sudo dnf clean all && sudo dnf makecache
+```
+
+#### 2. 安装 Jenkins
+
+```bash
+sudo dnf install -y jenkins
+```
+
+#### 3. 安装 Java 21（Jenkins 2.568+ 强制要求）
+
+CentOS 8 仓库中没有 Java 21，需手动下载解压：
+
+```bash
+wget https://download.java.net/openjdk/jdk21/ri/openjdk-21+35_linux-x64_bin.tar.gz
+sudo tar -xzf openjdk-21+35_linux-x64_bin.tar.gz -C /usr/local/
+```
+
+#### 4. 修改端口并指定 Java 路径（systemd override）
+
+```bash
+sudo systemctl edit jenkins
+```
+
+添加如下内容（避免 8080 端口冲突 + 指定 Java 路径）：
+
+```ini
+[Service]
+Environment="JENKINS_PORT=8086"
+Environment="JAVA_HOME=/usr/local/jdk-21"
+Environment="JENKINS_JAVA_CMD=/usr/local/jdk-21/bin/java"
+```
+
+#### 5. 启动 Jenkins
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart jenkins
+```
+
+#### 6. 验证启动
+
+```bash
+sudo systemctl status jenkins
+sudo journalctl -u jenkins -n 20 --no-pager
+```
+
+访问 `http://服务器IP:8086`，输入初始密码（`/var/lib/jenkins/secrets/initialAdminPassword`）完成初始化。
+
+#### 7. 常见坑与解决
+
+| 坑点 | 原因 | 解决方式 |
+| :--- | :--- | :--- |
+| `dnf update` 报错 `Failed to download metadata` | CentOS 8 官方源已 EOL | 改用阿里云 Vault 镜像（见步骤 1） |
+| `No match for argument: java-21-openjdk` | 仓库中无 Java 21 包 | 手动下载 OpenJDK 21 解压安装（步骤 3） |
+| Jenkins 启动失败（Java 版本过低） | 系统默认 Java 11/17，不满足 Jenkins 2.568+ 要求 | 安装 Java 21 并配置 `JAVA_HOME` |
+| 8080 端口被占用 | 其他服务占用 | 通过 systemd override 修改 `JENKINS_PORT` |
+| systemd override 配置未生效 | 未正确保存或格式错误 | 检查 `/etc/systemd/system/jenkins.service.d/override.conf` 存在且语法正确 |
+
+---
+
+### 二、后端服务部署流水线（Pipeline）配置
+
+#### 1. 需求描述
+
+在 Jenkins 上配置后端服务的构建部署流水线，执行以下步骤：
+
+1. 在 `/home/yan/items/nucur` 目录执行 `git pull`；
+2. 进入 `cmd/server` 目录；
+3. 执行 `./bd.sh nucur`（编译生成二进制文件 `nucur`）；
+4. 执行 `mv nucur /opt/nucur/bin`（会询问是否 overwrite，需要自动输入 `y`）；
+5. 执行 `sudo systemctl restart nucur` 重启服务。
+
+#### 2. 完整 Pipeline 脚本
+
+使用声明式 Pipeline，核心思路是：**用 `dir` 切换目录、用 `checkout` 拉代码、用 `mv -f` 强制覆盖、用 `sudo systemctl restart` 重启服务**。
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('代码更新') {
+            steps {
+                dir('/home/yan/items/nucur') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],            // 分支名，可按需修改
+                        userRemoteConfigs: [[
+                            url: 'git@github.com:your-repo.git', // 替换为实际仓库地址
+                            credentialsId: 'git-ssh-key'         // 使用已创建的凭据 ID
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('构建') {
+            steps {
+                dir('/home/yan/items/nucur/cmd/server') {
+                    sh './bd.sh nucur'
+                }
+            }
+        }
+
+        stage('部署') {
+            steps {
+                sh '''
+                    # 强制移动（-f 覆盖不询问，等价于自动输入 y）
+                    mv -f /home/yan/items/nucur/cmd/server/nucur /opt/nucur/bin/
+                    # 重启服务
+                    sudo systemctl restart nucur
+                '''
+            }
+        }
+    }
+}
+```
+
+#### 3. 关键说明
+
+| 步骤 | 操作 | 注意事项 |
+| :--- | :--- | :--- |
+| 代码更新 | `checkout` 拉取代码 | `checkout` 会**自动处理首次 clone 和后续 pull**，无需写 `fileExists` 判断 |
+| 构建 | `dir` 进入 `cmd/server`，执行 `./bd.sh nucur` | 脚本需有执行权限（`chmod +x bd.sh`），生成的可执行文件位于当前目录 |
+| 部署 | `mv -f` 强制覆盖 | `-f` 强制覆盖，避免提示确认；若想用 `yes`，可改为 `yes | mv ...` |
+| 重启 | `sudo systemctl restart nucur` | 需 Jenkins 用户有免密 sudo 权限 |
+
+**sudo 免密配置**：
+
+```bash
+sudo visudo
+# 添加一行：
+jenkins ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nucur
+```
+
+#### 4. 首次 clone 还是 pull 的判断逻辑
+
+`checkout` 步骤会自动处理，但若坚持用 Shell 脚本手动判断，可以这样写：
+
+```bash
+REPO_DIR="/home/yan/items/nucur"
+REPO_URL="git@github.com:your-repo.git"   # 替换为实际地址
+
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "目录已存在，执行 git pull"
+    cd "$REPO_DIR"
+    git pull
+else
+    echo "目录不存在，执行 git clone"
+    mkdir -p "$(dirname "$REPO_DIR")"
+    git clone "$REPO_URL" "$REPO_DIR"
+fi
+```
+
+#### 5. `checkout scm` 的含义
+
+`checkout scm` 是 Jenkins Pipeline 内置步骤，含义是：**使用当前任务配置中"源码管理"部分定义的参数（仓库地址、分支、凭证等）来拉取代码**，而不是在脚本里硬编码 URL。
+
+| 对比点 | 手写 `sh 'git clone ...'` | 使用 `checkout scm` |
+| :--- | :--- | :--- |
+| 凭证管理 | 需在脚本里处理密码/密钥，不安全 | 自动使用 Jenkins 界面配置的凭证 |
+| 分支选择 | 写死在脚本里 | 可灵活配置（多分支流水线自动识别） |
+| 可见性 | 操作隐藏在 Shell 脚本中 | 日志清晰显示检出进度，与构建记录绑定 |
+| 维护性 | 改仓库地址需改脚本 | 直接在任务界面修改即可 |
+
+> 前提条件：任务必须已配置"源码管理"，否则 `checkout scm` 会报 `No SCM configuration found`。
+
+#### 6. 凭据 ID 找不到的问题（域 / Scope）
+
+**现象**：已创建凭据，但在 Pipeline 的 SCM 配置下拉框中看不到。
+
+**原因**：凭据被存储在 `用户: admin` 域下，而任务默认只显示 `系统（System）` 域的凭据。
+
+**解决方式**：
+
+| 方法 | 说明 |
+| :--- | :--- |
+| 方法一（推荐） | 进入 `系统管理 → 凭据 → 系统（System）` 域，重新添加凭据，`Scope` 选 `全局（Global）` |
+| 方法二 | 直接在 Pipeline 脚本中用 `credentialsId` 指定凭据 ID，绕过下拉框 |
+| 方法三 | 使用 `Pipeline script` 模式，在 `checkout` 中显式声明 `credentialsId` |
+
+```groovy
+checkout([
+    $class: 'GitSCM',
+    branches: [[name: '*/main']],
+    userRemoteConfigs: [[
+        url: 'git@github.com:your-repo.git',
+        credentialsId: 'git-ssh-key'   // 直接指定已创建的凭据 ID
+    ]]
+])
+```
+
+---
+
+### 三、GitHub Webhook Secret 配置
+
+#### 1. Secret 是什么
+
+GitHub Webhook 配置中的 `Secret` 是一个用于**验证请求合法性、防止伪造和篡改**的安全令牌。
+
+- **来源验证**：防止恶意第三方伪造 GitHub 请求，避免执行未授权操作。
+- **完整性校验**：确保请求体（Payload）在传输中未被篡改。
+
+#### 2. 工作原理
+
+1. **设置共享密钥**：在 GitHub Webhook 配置页填写一个自定义 Secret。
+2. **计算并发送签名**：GitHub 用 Secret + 请求体，通过 HMAC-SHA256 计算哈希值，放在 `X-Hub-Signature-256` 请求头中随请求发送。
+3. **服务器验证**：Jenkins 收到请求后，用相同 Secret 对请求体做同样计算，与请求头中的签名比对，一致则通过。
+
+#### 3. 生成 Secret
+
+```bash
+# 生成 40 字符的随机十六进制字符串
+openssl rand -hex 20
+```
+
+```python
+import secrets
+# 生成 64 个十六进制字符的随机字符串
+secret = secrets.token_hex(32)
+print(secret)
+```
+
+> 不要把 Secret 硬编码在代码中或提交到仓库，应存储在环境变量或密钥管理服务中。
+
+#### 4. 在 Jenkins 中配置 Secret
+
+Secret **不在任务（Job/Pipeline）配置页里**，而是在 Jenkins 全局系统配置中：
+
+1. 进入 `系统管理 → 系统配置`。
+2. 找到 `GitHub` 配置区域（注意不要找错到 `GitHub Pull Request Builder` 等插件）。
+3. 点击 `高级...` 按钮。
+4. 在 `Shared Secret` 部分点击 `添加`。
+5. 弹出窗口中 `Kind` 选 `Secret text`，`Secret` 填入与 GitHub Webhook 设置中**完全相同**的字符串，保存。
+6. 回到系统配置页，点击底部 `保存`。
+
+> 关键点：GitHub 侧的 Secret 与 Jenkins 全局的 Shared Secret **必须完全一致**，Jenkins 才能验证来自 GitHub 的请求合法。
+
+---
+
+
+
+## 4. GitHub 的 Webhook 触发 Jenkins 任务
 
 ### 问题
 如何实现"开发人员把代码 push 到 GitHub 后，Jenkins 自动拉取最新代码并触发构建 / 部署任务"？
