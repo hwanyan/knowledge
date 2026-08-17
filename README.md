@@ -4163,6 +4163,57 @@ sudo visudo
 jenkins ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nucur
 ```
 
+**💡 代码目录（workspace）放哪里？**
+
+Jenkins 默认把代码拉到 `${JENKINS_HOME}/workspace/<job-name>/`（如 `/var/lib/jenkins/workspace/<job>/`），这是标准设计。**不建议**改成 `/home/yan/items` 这类自定义路径，原因：① 并发构建会互相覆盖代码；② 跨用户权限难管理；③ 备份/迁移/多 Agent 复用逻辑被打乱；④ 磁盘清理插件默认只扫 `workspace/`，自定义路径易泄漏磁盘。
+
+**最佳实践**：保持默认 workspace；如需换磁盘，通过 `JENKINS_HOME` 或 Agent 的 `Remote root directory` 整体迁移，而非改单个 Job；前后端项目用 `workspace` 内子目录区分（`backend/`、`frontend/`）；构建产物（二进制、`dist`、镜像）通过 `archiveArtifacts` 或制品仓库处理，不与源码混放。
+
+**改进后的 Pipeline 脚本（基于上述最佳实践）**：
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('代码更新') {
+            steps {
+                // 拉代码到默认 workspace，不硬编码 /home/yan/items 这类自定义路径
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:your-repo.git',
+                        credentialsId: 'git-ssh-key'
+                    ]]
+                ])
+            }
+        }
+
+        stage('构建') {
+            steps {
+                // 在 workspace 内的子目录构建，而非系统用户目录
+                dir("${WORKSPACE}/cmd/server") {
+                    sh './bd.sh nucur'
+                }
+            }
+        }
+
+        stage('部署') {
+            steps {
+                sh '''
+                    # 源码留在 workspace，构建产物部署到 /opt（源码与产物分离）
+                    mv -f "${WORKSPACE}/cmd/server/nucur" /opt/nucur/bin/
+                    sudo systemctl restart nucur
+                '''
+            }
+        }
+    }
+}
+```
+
+> 与原脚本的关键差异：不再硬编码 `/home/yan/items/nucur`，代码统一落在默认 `${WORKSPACE}` 下；构建产物（`nucur`）只在部署阶段移动到 `/opt/nucur/bin`，实现源码与产物分离。
+
 #### 4. 首次 clone 还是 pull 的判断逻辑
 
 `checkout` 步骤会自动处理，但若坚持用 Shell 脚本手动判断，可以这样写：
