@@ -27,6 +27,7 @@
 - [2. 在服务器上编译基于 vue 实现的前端代码并部署的流程](#2-在服务器上编译基于-vue-实现的前端代码并部署的流程)
 - [3. Jenkins 安装与后端服务部署流水线配置](#3-jenkins-安装与后端服务部署流水线配置)
 - [4. GitHub 的 Webhook 触发 Jenkins 任务](#4-github-的-webhook-触发-jenkins-任务)
+- [5. Docker 容器技术入门与常用命令及 Demo 脚本](#5-docker-容器技术入门与常用命令及-demo-脚本)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -4473,6 +4474,203 @@ Jenkins 端校验逻辑（伪代码）：
 | 私有仓库拉取失败 | Credentials 配置错误或 Token 权限不足（需勾选 `repo` 权限） |
 | 内网 Jenkins 收不到 | 需使用内网穿透（ngrok / frp）暴露公网地址 |
 | 构建产物部署失败 | 检查 Jenkins 执行用户是否有目标服务器 SSH 权限 |
+
+---
+
+
+
+## 5. Docker 容器技术入门与常用命令及 Demo 脚本
+
+### 问题
+Docker 是什么？它解决了什么问题？如何编写一个简单的 Docker 部署脚本？
+
+### 解答
+
+#### 一、Docker 是什么
+
+Docker 是一个容器化平台，它可以把应用程序及其所有依赖（代码、运行时、系统工具、库、配置文件）打包成一个标准化的单元—— **镜像（Image）**，然后在任何支持 Docker 的环境中，以 **容器（Container）** 的形式一致地运行。
+
+> 一句话理解："在我电脑上能跑" → "在任何地方都能跑"。
+
+#### 二、Docker 存在的意义（解决了什么问题）
+
+| 传统部署的痛点 | Docker 的解决方式 |
+| :--- | :--- |
+| 开发、测试、生产环境不一致，导致"这段代码在我机器上是好的" | 镜像里打包了完整运行环境，环境一致性得到保证 |
+| 虚拟机（VM）太重，启动慢、资源占用大 | 容器共享主机内核，秒级启动，资源占用小得多 |
+| 依赖冲突：不同应用需要不同版本的运行时/库 | 每个容器相互隔离，各自的依赖互不影响 |
+| 部署流程复杂，手动配置环境容易出错 | Dockerfile 声明式定义环境，一次编写、随处运行 |
+| 扩容/迁移成本高 | 镜像可快速分发、复制、水平扩展（配合 K8s 等编排更方便） |
+
+**虚拟机 vs 容器架构对比：**
+
+```text
+虚拟机架构：                     容器架构：
+       App A | App B                 App A  | App B
+    Bin/Libs | Bin/Libs            Bin/Libs | Bin/Libs
+    Guest OS | Guest OS              
+ ------- Hypervisor -------    -------- Docker Engine --------
+          Host OS                         Host OS
+```
+
+> 容器不需要模拟一整套操作系统，只在内核之上隔离进程、文件系统、网络等资源，因此比虚拟机轻量得多。
+
+#### 三、核心概念
+
+| 概念 | 说明 |
+| :--- | :--- |
+| **镜像（Image）** | 只读模板，包含应用运行所需的一切，由多个只读层（Layer）叠加组成 |
+| **容器（Container）** | 镜像的运行实例，是镜像上加了一层可写层后启动的进程 |
+| **Dockerfile** | 一份文本文件，用指令描述"如何一步步构建出镜像" |
+| **镜像仓库（Registry）** | 存放和分发镜像的地方，如 Docker Hub（公有）、Harbor（私有仓库） |
+
+**常用命令关系：**
+
+```text
+Dockerfile  --(docker build)-->  Image  --(docker push)-->  Registry(Harbor)
+                                    ↓
+                              (docker run)
+                                    ↓
+                                 Container
+```
+
+---
+
+#### 四、常用 Docker 命令速查
+
+**1. 镜像相关**
+
+```bash
+# 拉取镜像（从 Registry 下载）
+docker pull nginx:latest
+
+# 查看本地所有镜像
+docker images
+
+# 删除镜像（需先删除使用它的容器）
+docker rmi <镜像ID或名称:标签>
+
+# 给镜像打标签（为 push 做准备）
+docker tag <源镜像> <仓库地址>/<命名空间>/<镜像名>:<标签>
+```
+
+**2. 容器相关**
+
+```bash
+# 创建并启动容器（后台运行，映射端口，指定名称）
+docker run -d -p 8080:80 --name my-nginx nginx:latest
+
+# 查看正在运行的容器
+docker ps
+
+# 查看所有容器（含已停止）
+docker ps -a
+
+# 停止 / 启动 / 重启容器
+docker stop <容器名或ID>
+docker start <容器名或ID>
+docker restart <容器名或ID>
+
+# 进入正在运行的容器（交互式 shell）
+docker exec -it <容器名或ID> /bin/bash
+
+# 查看容器日志（-f 实时跟踪）
+docker logs -f <容器名或ID>
+
+# 删除容器（-f 强制删除运行中的容器）
+docker rm -f <容器名或ID>
+```
+
+**3. 构建与推送**
+
+```bash
+# 使用当前目录下的 Dockerfile 构建镜像（-t 指定名称:标签）
+docker build -t myapp:latest .
+
+# 登录私有仓库（如 Harbor）
+docker login <仓库地址>
+
+# 推送镜像到 Registry
+docker push <仓库地址>/<命名空间>/myapp:latest
+```
+
+**4. 其他常用**
+
+```bash
+# 查看磁盘占用 / 清理无用的镜像、容器、网络、缓存
+docker system df
+docker system prune -a
+
+# 查看容器资源占用（CPU、内存）
+docker stats
+
+# 查看镜像分层构建历史
+docker history <镜像名>
+```
+
+---
+
+#### 五、一个简单的 Demo 脚本（带详细注释）
+
+以下脚本演示了「构建镜像 → 停止旧容器 → 启动新容器」的完整部署流程，可直接用于后端服务的快速部署：
+
+```bash
+#!/usr/bin/env bash
+# set -e：任何一条命令执行失败就立即退出，避免带病继续执行
+set -e
+
+# ========== 1. 定义变量 ==========
+# 镜像名称与标签（镜像名小写，标签用版本号或 latest）
+IMAGE_NAME="myapp"
+IMAGE_TAG="latest"
+
+# 容器名称（同一服务固定名称，方便停止/更新）
+CONTAINER_NAME="myapp-server"
+
+# 宿主机端口:容器端口（对外暴露 8080，容器内服务监听 8080）
+HOST_PORT=8080
+CONTAINER_PORT=8080
+
+# ========== 2. 构建镜像 ==========
+# -t：给镜像打上名称和标签
+# .：使用当前目录下的 Dockerfile 作为构建上下文
+echo "[1/3] 构建镜像 ${IMAGE_NAME}:${IMAGE_TAG} ..."
+docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+
+# ========== 3. 停止并删除旧容器 ==========
+# 先停止旧容器（若不存在则忽略报错，|| true 保证脚本不中断）
+echo "[2/3] 停止并删除旧容器 ${CONTAINER_NAME} ..."
+docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+# ========== 4. 启动新容器 ==========
+# -d：后台运行（detached）
+# -p：端口映射，宿主机端口:容器端口
+# --name：指定容器名称，便于后续管理
+# --restart unless-stopped：容器异常退出时自动重启（手动 stop 后不重启）
+echo "[3/3] 启动新容器 ${CONTAINER_NAME} ..."
+docker run -d \
+  --name "${CONTAINER_NAME}" \
+  -p "${HOST_PORT}:${CONTAINER_PORT}" \
+  --restart unless-stopped \
+  "${IMAGE_NAME}:${IMAGE_TAG}"
+
+# ========== 5. 查看结果 ==========
+echo "部署完成！容器状态如下："
+docker ps --filter "name=${CONTAINER_NAME}"
+```
+
+**使用方式：**
+
+```bash
+# 赋予执行权限
+chmod +x deploy.sh
+
+# 执行部署
+./deploy.sh
+```
+
+> 说明：脚本假设当前目录下已存在 `Dockerfile`。若容器需要读取环境变量或挂载配置文件，可在 `docker run` 中追加 `-e KEY=VALUE`（设置环境变量）或 `-v 宿主机路径:容器路径`（挂载数据卷）。
 
 ---
 
