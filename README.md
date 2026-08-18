@@ -5072,9 +5072,8 @@ pipeline {
         stage('部署') {
             steps {
                 sh '''
-                    sudo mv -f "${WORKSPACE}/nucur/cmd/server/nucur" /opt/nucur/bin/
-                    sudo chown user-nucur:user-nucur /opt/nucur/bin/nucur
-                    sudo systemctl restart nucur
+                    install -m 0640 "${WORKSPACE}/nucur/cmd/server/nucur" /opt/nucur/staging/nucur.new
+                    sudo /usr/local/sbin/deploy-nucur.sh
                 '''
             }
         }
@@ -5091,17 +5090,18 @@ pipeline {
 
 **2. 改造方案**
 
-在"构建"和"部署"之间插入 **构建镜像** 和 **推送镜像** 两个新阶段，部署阶段改为 `docker pull` + `docker run` 替代原来的二进制搬运 + `systemctl restart`：
+在"构建"和"部署"之间插入 **构建镜像** 和 **推送镜像** 两个新阶段，部署阶段改为 `docker pull` + `docker run` 替代原来的二进制搬运 + `systemctl restart`。
+在此基础上，再把"编译"这一步完全移进 Dockerfile 的多阶段构建里，bd.sh 恢复原样再被 pipeline 调用，Jenkinsfile 也去掉单独的"构建"阶段，只保留"构建镜像"（内部完成编译+打包）。：
 
 ```groovy
 pipeline {
     agent any
 
     environment {
-        // Harbor 仓库地址与镜像命名，集中管理，避免散落各处
-        HARBOR_REGISTRY = 'harbor.mycompany.com'
-        IMAGE_NAME      = "${HARBOR_REGISTRY}/nucur/nucur"
-        IMAGE_TAG       = "${env.BUILD_NUMBER}"   // 用构建号做版本号，禁止只用 latest
+         // 腾讯云 CCR 镜像仓库地址与镜像命名，集中管理，避免散落各处
+        IMAGE_REGISTRY = 'ccr.ccs.tencentyun.com'
+        IMAGE_NAME     = "${IMAGE_REGISTRY}/nucur/nucur"
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"   // 用构建号做版本号，禁止只用 latest
     }
 
     stages {
@@ -5122,39 +5122,29 @@ pipeline {
             }
         }
 
-        stage('构建') {
-            steps {
-                dir("${WORKSPACE}/nucur/cmd/server") {
-                    sh '''
-                        export PATH=/usr/local/go/bin:$PATH
-                        export GOPROXY=https://goproxy.cn,direct
-                        export CGO_ENABLED=0
-                        ./bd.sh nucur
-                    '''
-                }
-            }
-        }
+        // 原"构建"阶段（调用 bd.sh 在 Agent 本机编译）已移除，
+        // 编译逻辑现在整合进下面 docker build 的多阶段构建中
 
         stage('构建镜像') {
             steps {
-                dir("${WORKSPACE}/nucur/cmd/server") {
-                    sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+                // 构建上下文切到仓库根目录（nucur/），因为要读取 go.mod/go.sum 及全部源码
+                dir("${WORKSPACE}/nucur") {
+                    sh "docker build -f cmd/server/Dockerfile -t ${IMAGE_NAME}:${IMAGE_TAG} ."
                 }
             }
         }
 
         stage('推送镜像') {
             steps {
-                // 用 Jenkins Credentials 存 Harbor 账号密码，避免明文出现在脚本/日志里
                 withCredentials([usernamePassword(
-                    credentialsId: 'harbor-cred',
-                    usernameVariable: 'HARBOR_USER',
-                    passwordVariable: 'HARBOR_PASS'
+                    credentialsId: 'TencentCCR-Cred',
+                    usernameVariable: 'CCR_USER',
+                    passwordVariable: 'CCR_PASS'
                 )]) {
                     sh '''
-                        echo "$HARBOR_PASS" | docker login ${HARBOR_REGISTRY} -u "$HARBOR_USER" --password-stdin
+                        echo "$CCR_PASS" | docker login ${IMAGE_REGISTRY} -u "$CCR_USER" --password-stdin
                         docker push ${IMAGE_NAME}:${IMAGE_TAG}
-                        docker logout ${HARBOR_REGISTRY}
+                        docker logout ${IMAGE_REGISTRY}
                     '''
                 }
             }
@@ -5162,16 +5152,19 @@ pipeline {
 
         stage('部署') {
             steps {
+                // 注意需要挂载外部用到的环境变量、日志、上传目录等
                 sh '''
                     docker pull ${IMAGE_NAME}:${IMAGE_TAG}
 
-                    # 存在旧容器则先停止移除，保证幂等，重复执行不报错
                     docker rm -f nucur || true
 
                     docker run -d \
                         --name nucur \
                         --restart=always \
                         -p 8080:8080 \
+                        -v /opt/nucur/env:/opt/nucur/env:ro \
+                        -v /opt/nucur/log:/opt/nucur/log \
+                        -v /opt/nucur/uploads:/opt/nucur/uploads \
                         ${IMAGE_NAME}:${IMAGE_TAG}
                 '''
             }
@@ -5194,33 +5187,52 @@ pipeline {
 
 #### 二、Dockerfile 设计（打包已编译好的二进制）
 
-由于 `bd.sh` 已在 Agent 上完成编译，Dockerfile 只做"打包"，不重复编译，基础镜像选用轻量的 `alpine` + `ca-certificates`/`tzdata`：
+基础镜像选用轻量的 `alpine` + `ca-certificates`/`tzdata`：
 
 ```dockerfile
-# 多阶段无需：二进制已在 Jenkins Agent 编译好，这里只负责装进镜像
+# cmd/server/Dockerfile
+
+# ---------- 阶段一：编译 ----------
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
+
+ENV GOPROXY=https://goproxy.cn,direct \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+WORKDIR /build
+
+# 先只拷贝 go.mod/go.sum，利用 Docker 层缓存：
+# 依赖不变时，下面这层直接复用缓存，不用每次重新下载全部依赖
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 再拷贝全部源码
+COPY . .
+
+# 编译指定包路径（main.go 在 cmd/server 下）
+RUN go build -ldflags="-s -w" -o /build/nucur ./cmd/server
+
+# ---------- 阶段二：运行时镜像 ----------
 FROM alpine:3.19
 
-# 时区 + CA 证书（访问 HTTPS 服务、做 DNS/时间校准时必需）
 RUN apk add --no-cache ca-certificates tzdata \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 
-# 以非 root 用户运行，降低容器逃逸风险
 RUN addgroup -S nucur && adduser -S nucur -G nucur
 
 WORKDIR /app
 
-# 放入已编译好的二进制（由 bd.sh 产出，要求 CGO_ENABLED=0 静态编译）
-COPY nucur /app/nucur
-
-# 给二进制执行权限
+COPY --from=builder /build/nucur /app/nucur
 RUN chmod +x /app/nucur
 
 USER nucur
 
 EXPOSE 8080
 
-# 启动命令
 ENTRYPOINT ["/app/nucur"]
 ```
 
