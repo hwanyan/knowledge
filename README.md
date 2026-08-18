@@ -28,9 +28,10 @@
 - [3. Jenkins 安装与后端服务部署流水线配置](#3-jenkins-安装与后端服务部署流水线配置)
 - [4. GitHub 的 Webhook 触发 Jenkins 任务](#4-github-的-webhook-触发-jenkins-任务)
 - [5. Jenkins 与 systemd 的应用自启及端口冲突分析](#5-jenkins-与-systemd-的应用自启及端口冲突分析)
-- [6. Docker 容器技术入门与常用命令及 Demo 脚本](#6-docker-容器技术入门与常用命令及-demo-脚本)
-- [7. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型](#7-nucur-服务-docker-化改造实战从-jenkinsfile-集成cgo-静态编译陷阱到镜像仓库选型)
-- [8. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理](#8-nucur-服务-docker-化时宿主机本地资源配置日志上传目录的挂载处理)
+- [6. Jenkins 部署权限最佳实践：sudoers 收紧与 user-nucur 运行时身份隔离](#6-jenkins-部署权限最佳实践sudoers-收紧与-user-nucur-运行时身份隔离)
+- [7. Docker 容器技术入门与常用命令及 Demo 脚本](#7-docker-容器技术入门与常用命令及-demo-脚本)
+- [8. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型](#8-nucur-服务-docker-化改造实战从-jenkinsfile-集成cgo-静态编译陷阱到镜像仓库选型)
+- [9. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理](#9-nucur-服务-docker-化时宿主机本地资源配置日志上传目录的挂载处理)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -4559,7 +4560,183 @@ nohup /opt/nucur/bin/nucur &
 
 
 
-## 6. Docker 容器技术入门与常用命令及 Demo 脚本
+## 6. Jenkins 部署权限最佳实践：sudoers 收紧与 user-nucur 运行时身份隔离
+
+### 问题
+在 Jenkins 自动化部署 nucur 服务时，`/opt/nucur` 各目录属主是 `user-nucur`，而 Jenkins 以 `jenkins` 用户运行，导致 `mv`、`chown` 等操作权限不足。有人会这样配置 sudo 白名单：
+
+```text
+jenkins ALL=(ALL) NOPASSWD: /usr/bin/mv, /usr/bin/chown, /usr/bin/systemctl restart nucur
+```
+
+也有人反过来想："既然用了 Jenkins 管理部署，`user-nucur` 是不是多余了？干脆删掉它，把 `/opt/nucur` 交给 jenkins 直接操作？"
+
+这两种做法分别错在哪？最佳实践应该怎么设计权限边界？
+
+### 解答
+
+#### 一、裸 `mv`/`chown` 放行 = 变相给 jenkins 完整 root 权限
+
+`jenkins ALL=(ALL) NOPASSWD: /usr/bin/mv, /usr/bin/chown, ...` 这条规则等价于给 jenkins 完整 root 权限。问题不在 `systemctl restart nucur`（参数固定，本身没问题），而在 `mv` 和 `chown` 这两项：
+
+- `sudo /usr/bin/mv` **没限定任何参数** → jenkins 能把任意源文件移动到任意目标路径，覆盖任意 root 文件。典型攻击链：
+  - `sudo mv /tmp/evil_sudoers /etc/sudoers` → 直接改写 sudo 规则，给自己 `ALL=(ALL) NOPASSWD: ALL`
+  - `sudo mv /tmp/fake_passwd /etc/passwd`（塞一个 UID 0 的新用户）→ 直接 root 登录
+  - 覆盖任意 systemd unit 文件、`authorized_keys`、cron 任务等 → 任意代码以 root 执行
+- `sudo /usr/bin/chown` 同样没限定参数 → 能把任意文件的属主改成 jenkins/其他用户，之后配合 `chmod`（jenkins 作为新属主可以自行 chmod）就能写入本来无权写的文件——这是经典的"unrestricted chown 提权"套路。
+- `(ALL)`（而非 `(root)`）也是多余的权限面，这两个命令根本不需要"以任意用户身份执行"。
+
+也就是说：只要能改动 Jenkinsfile（或 Jenkins 本身/凭证被攻破），攻击者拿到的不是"能部署 nucur"的权限，而是整台机器的 root。这违反了**最小权限原则**。
+
+> **硬规则：sudoers 里对 `mv`/`cp`/`chown`/`rm` 这类通用文件操作命令，永远不要不带参数放行。**
+
+#### 二、最佳实践：固定 root 脚本 + staging 中转目录
+
+核心思路：把"做什么"（固定逻辑）和"谁能触发"（jenkins 触发权）分离。jenkins 只能"点火"，具体动作（路径、属主、权限、重启哪个 unit）全部硬编码在一个 jenkins 不可写的 root 脚本里，参数不从命令行传入。
+
+**第 1 步：新建一个 jenkins 可写的中转目录（交接构建产物，无需 sudo）**
+
+```bash
+sudo mkdir -p /opt/nucur/staging
+sudo chown jenkins:jenkins /opt/nucur/staging
+sudo chmod 750 /opt/nucur/staging
+```
+
+Jenkins 构建完后直接 `cp`（不需要 sudo，这个目录归 jenkins 所有）把二进制放进去。
+
+**第 2 步：写一个固定逻辑的 root 部署脚本**
+
+`/usr/local/sbin/deploy-nucur.sh`（不接受任何参数，路径全部硬编码）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SRC="/opt/nucur/staging/nucur.new"
+DST="/opt/nucur/bin/nucur"
+SERVICE="nucur.service"
+
+[[ -f "$SRC" ]] || { echo "deploy: $SRC not found" >&2; exit 1; }
+
+# 一步完成拷贝+属主+权限，原子替换，避免单独 mv+chown 两步留下的中间态
+install -o user-nucur -g user-nucur -m 0750 "$SRC" "$DST"
+
+systemctl restart "$SERVICE"
+```
+
+关键点：这个脚本本身必须 jenkins 不可写，否则 sudo 白名单形同虚设：
+
+```bash
+sudo chown root:root /usr/local/sbin/deploy-nucur.sh
+sudo chmod 700 /usr/local/sbin/deploy-nucur.sh
+```
+
+**第 3 步：sudoers 只放行这一个固定脚本**
+
+```bash
+sudo visudo
+```
+
+删掉之前的 `mv, chown, systemctl` 规则，替换为：
+
+```text
+jenkins ALL=(root) NOPASSWD: /usr/local/sbin/deploy-nucur.sh
+```
+
+对比：目标用户从 `(ALL)` 收紧为 `(root)`；可执行内容从"任意 mv/chown 参数"收紧为"这一个脚本、零参数"。jenkins 拿到的能力精确等于"安装 nucur 二进制 + 重启 nucur 服务"。
+
+**第 4 步：更新 Jenkinsfile 的部署阶段**
+
+```groovy
+stage('部署') {
+    steps {
+        sh '''
+            install -m 0640 "${WORKSPACE}/nucur/cmd/server/nucur" /opt/nucur/staging/nucur.new
+            sudo /usr/local/sbin/deploy-nucur.sh
+        '''
+    }
+}
+```
+
+第一行不需要 sudo（jenkins 本身拥有 `/opt/nucur/staging`），第二行只触发那一个被严格限定的脚本。
+
+#### 三、`systemctl restart` 是否有更"原生"的免 sudo 方式
+
+systemd 通过 polkit 的 `org.freedesktop.systemd1.manage-units` 理论上支持按 unit 名称做细粒度授权，但目前 systemd/polkit 对这个 action 的 unit/verb 参数化限制并不完整可靠，贸然写 polkit 规则以为"只授权了 nucur.service"，实际授权范围可能比预期更宽。所以**不建议依赖它**，继续放进上面的 root 脚本里统一管理更稳妥。
+
+#### 四、次要风险：`env.conf` 敏感信息权限
+
+`/opt/nucur/env/env.conf` 里放了数据库连接串等敏感信息，若目录权限是 755，任何本地用户都能读到。systemd 的 `EnvironmentFile` 是由 root（systemd 本身）读取后再降权注入进程环境的，收紧权限完全不影响服务启动：
+
+```bash
+sudo chmod 700 /opt/nucur/env
+sudo chmod 600 /opt/nucur/env/env.conf
+sudo chown root:root /opt/nucur/env/env.conf
+```
+
+#### 五、为什么不能移除 `user-nucur`
+
+"移除 user-nucur，让 jenkins 直接部署操作"是这套架构里最不该做的事。`user-nucur` 不是多余的，而是当前设计里唯一起作用的安全边界。
+
+两个身份对应两个完全不同的信任域：
+
+| 维度 | `jenkins` 用户 | `user-nucur` 用户 |
+| :--- | :--- | :--- |
+| 代表什么 | CI/CD 系统身份 | 业务进程运行时身份 |
+| 能触达什么 | GitHub SSH 部署密钥（可能不止 nucur 一个仓库）、Jenkins Credential Store、其他 job 的 workspace、受限 sudo 出口 | 只有 `/opt/nucur` 一棵目录树、`/sbin/nologin`、无 sudo |
+| 攻击入口 | Jenkinsfile 被改、Jenkins 凭证泄露、Jenkins 自身 0day | nucur 应用自身漏洞——尤其它接收用户上传文件（`uploads/`），这是 web 应用最常见的 RCE 入口（文件上传绕过、路径穿越、反序列化等） |
+
+关键问题是：nucur 这个服务**直接暴露给外部用户使用**（有上传功能），攻击面天然比 Jenkins 大得多。如果 nucur 进程以 jenkins 身份运行（或 jenkins 拥有 `/opt/nucur` 写权限），一旦业务进程被攻破，攻击者拿到的就不是"user-nucur 在 `/opt/nucur` 里能做的那点事"，而是：
+
+- jenkins 的 GitHub SSH 私钥 → 能推恶意代码到所有仓库；
+- Jenkins Credential Store 里所有项目的凭证；
+- 如果 jenkins 还留有任何 sudo 权限 → 直接跳板到 root；
+- 同一台 Jenkins 上其他 job 的产物/workspace。
+
+也就是说：合并身份会把"一个业务应用的漏洞"直接升级成"整条 CI/CD 供应链被攻破"，影响范围从"nucur 一个服务"扩大到"所有项目"。这是典型的**攻击面扩大（blast radius 扩大）**。
+
+反过来，保持 `user-nucur` 独立、nologin、无 sudo，是故意设计的"死胡同"：即使 nucur 进程被攻破，攻击者也只能在 `logs/`、`uploads/` 里折腾，碰不到密钥、碰不到其他项目、碰不到 root。
+
+#### 六、真正该优化的方向：收紧 jenkins 的常驻权限
+
+正确路径是**缩小 jenkins 的常驻权限**，把"跨身份的特权动作"收窄到一个不可篡改的固定通道（root 脚本），而不是把 jenkins 提升到跟 user-nucur 平级甚至更高。
+
+结合两轮问答，最终权限模型如下：
+
+| 目录/文件 | 属主 | 权限 | 理由 |
+| :--- | :--- | :--- | :--- |
+| `/opt/nucur/bin/` | root:root | 755 | 不再给 user-nucur 写权限——进程运行时不需要改自己的二进制，即使被攻破也无法自我替换 |
+| `/opt/nucur/bin/nucur` | root:root | 750（user-nucur 所在组可读可执行） | 只有部署脚本（root）能覆盖它 |
+| `/opt/nucur/env/env.conf` | root:root | 600 | systemd 以 root 读取后注入子进程环境，user-nucur 无需文件系统读权限 |
+| `/opt/nucur/logs/` | user-nucur:user-nucur | 750 | 运行时需要写，保持不变 |
+| `/opt/nucur/uploads/` | user-nucur:user-nucur | 750 | 运行时需要写；nginx 要读的话把 nginx 用户加进 user-nucur 组，而不是放大 other 权限 |
+| `/opt/nucur/staging/`（新增） | jenkins:jenkins | 750 | jenkins 的写权限仅限于此，出了这个目录无任何标准写权限 |
+
+jenkins 在整个 `/opt/nucur` 里，标准情况下唯一能写的地方就是 `staging/`。从 `staging/` 到 `bin/` 这一步"跨越信任边界"的动作必须走 root 中转（固定脚本 `deploy-nucur.sh`），脚本本身 jenkins 不可写、参数不可控，jenkins 只能"触发"，改不了"做什么"。
+
+这个模型的效果：
+
+- **jenkins 被攻破** → 最多塞一个假的 `nucur.new` 到 staging，但没有 root，也读不到其他目录；
+- **nucur 进程被攻破** → 被限制在 `logs/`、`uploads/` 内，读不到 `env.conf`，写不了 `bin/`，无法自我提权或篡改可执行文件。
+
+两个身份任何一个出问题，都不会自动牵连到另一个。
+
+#### 七、小结
+
+| 项目 | 原方案（错误） | 推荐方案 |
+| :--- | :--- | :--- |
+| sudo 授权命令 | 裸 `mv`/`chown`（无参数限制）+ `systemctl restart nucur` | 单一固定脚本 `deploy-nucur.sh`（零参数） |
+| 目标用户 | `(ALL)` | `(root)` |
+| 攻击面 | 任意文件读写 → 全机 root | 仅"安装 nucur 二进制 + 重启 nucur" |
+| 前提 | — | 脚本必须 `root:root 700`，jenkins 绝对不可写 |
+
+> **一句话总结**：不要因为"想让 jenkins 部署更顺手"而抹掉 `user-nucur` 这层隔离；正确方向是**收紧 jenkins 的常驻权限**（把 `bin/` 也从 user-nucur 可写改成只有 root 可写），把 CI 身份与运行时身份之间唯一的交互面，焊死在一个内容固定、jenkins 不可篡改的 root 脚本上。在有外部用户上传入口的服务上，这层隔离几乎是防止"应用层漏洞升级为供应链攻陷"的最后一道墙，不能省。
+
+---
+
+
+
+## 7. Docker 容器技术入门与常用命令及 Demo 脚本
 
 ### 问题
 Docker 是什么？它解决了什么问题？如何编写一个简单的 Docker 部署脚本？
@@ -4756,7 +4933,7 @@ chmod +x deploy.sh
 
 
 
-## 7. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型
+## 8. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型
 
 ### 问题
 如何把一个原本"裸机部署"（编译二进制 → mv → systemctl restart）的 Go 后端服务，改造成 Docker 化交付？改造过程中有哪些容易踩的坑？
@@ -5030,7 +5207,7 @@ fi
 
 
 
-## 8. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理
+## 9. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理
 
 ### 问题
 nucur 服务依赖宿主机的一些本地资源：`/opt/nucur/env/env.config`（环境变量配置，含数据库 DSN、配置开关等）、`/opt/nucur/log/`（生成的日志）、`/opt/nucur/uploads/`（用户上传的资源，通过 nginx 暴露路径访问）、`/opt/nucur/bin/nucur`（可执行二进制）。改用 Docker 后这些资源要如何处理？Docker 的价值是不是就是把应用及所有依赖环境全部打进镜像？
