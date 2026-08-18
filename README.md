@@ -29,9 +29,10 @@
 - [4. GitHub 的 Webhook 触发 Jenkins 任务](#4-github-的-webhook-触发-jenkins-任务)
 - [5. Jenkins 与 systemd 的应用自启及端口冲突分析](#5-jenkins-与-systemd-的应用自启及端口冲突分析)
 - [6. Jenkins 部署权限最佳实践：sudoers 收紧与 user-nucur 运行时身份隔离](#6-jenkins-部署权限最佳实践sudoers-收紧与-user-nucur-运行时身份隔离)
-- [7. Docker 容器技术入门与常用命令及 Demo 脚本](#7-docker-容器技术入门与常用命令及-demo-脚本)
-- [8. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型](#8-nucur-服务-docker-化改造实战从-jenkinsfile-集成cgo-静态编译陷阱到镜像仓库选型)
-- [9. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理](#9-nucur-服务-docker-化时宿主机本地资源配置日志上传目录的挂载处理)
+- [7. 前端静态站点 Jenkins 部署的权限与原子发布最佳实践](#7-前端静态站点-jenkins-部署的权限与原子发布最佳实践)
+- [8. Docker 容器技术入门与常用命令及 Demo 脚本](#8-docker-容器技术入门与常用命令及-demo-脚本)
+- [9. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型](#9-nucur-服务-docker-化改造实战从-jenkinsfile-集成cgo-静态编译陷阱到镜像仓库选型)
+- [10. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理](#10-nucur-服务-docker-化时宿主机本地资源配置日志上传目录的挂载处理)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -4658,7 +4659,11 @@ stage('部署') {
 }
 ```
 
-第一行不需要 sudo（jenkins 本身拥有 `/opt/nucur/staging`），第二行只触发那一个被严格限定的脚本。
+注：install 是 Linux 系统的一个标准工具，主要用于复制文件并设置属性（比直接使用 cp + chmod + chown 更便捷和原子化）。它通常用于编译后的安装步骤或部署脚本中。
+
+上述 “部署” 阶段中：第一行命令不需要 sudo（jenkins 本身拥有 `/opt/nucur/staging`），它的作用是将 ${WORKSPACE}/nucur/cmd/server/nucur 放入 staging 目录并以 .new 结尾，同时设置权限为 640（确保该二进制文件可以被 jenkins 用户写入和读取，同组的 jenkins 用户可以读取，但其他用户无权访问）
+
+第二行只触发那一个被严格限定的脚本。
 
 #### 三、`systemctl restart` 是否有更"原生"的免 sudo 方式
 
@@ -4736,7 +4741,89 @@ jenkins 在整个 `/opt/nucur` 里，标准情况下唯一能写的地方就是 
 
 
 
-## 7. Docker 容器技术入门与常用命令及 Demo 脚本
+## 7. 前端静态站点 Jenkins 部署的权限与原子发布最佳实践
+
+### 问题
+前端 `nucur-web` 的 Jenkins 部署脚本把打包产物部署到 `/opt/www/nucur`，为了让 CI 能写入，把该目录权限调整为 `drwxr-xr-x jenkins jenkins`。这样做是否标准？有哪些权限隐患？
+
+### 解答
+
+#### 一、为什么前端不能直接类比后端
+
+后端坚持不让 jenkins 拥有 `/opt/nucur`，核心理由是：存在一个独立的运行时身份（`user-nucur`）需要被隔离，用来兜底"应用层漏洞（如上传功能被攻破）不能升级成 CI 系统被攻陷"。
+
+前端这里**没有这个对应角色**。`/opt/www/nucur` 里是纯静态文件，由 nginx 读取对外提供服务，nginx 只需读+执行，不需要写权限。这里没有一个类似 `user-nucur` 的、会执行不可信输入（用户上传等）的运行时进程需要隔离——nginx 是成熟的静态文件服务器，它的账户（`nginx`/`www-data`）和内容属主本来就是两件事，不需要引入第三个身份去"中转"。
+
+所以"jenkins 独占 `/opt/www/nucur` 这一个项目目录（而非整个 `/opt/www`）"的**项目粒度属主**，方向是对的，也是 Netlify/Vercel/GitHub Pages 这类静态站 CI/CD 的标准模型——构建产物本身就是要发布的内容，CI 和"发布物"天然同属一个信任域，强行加一层特权中转（像后端那样搞 root 脚本）没有实际收益。
+
+#### 二、真正需要关注/修复的点
+
+**1. 部署不是原子操作（关键，可用性问题）**
+
+```bash
+rm -rf /opt/www/nucur/*
+cp -rf "${WORKSPACE}/nucur-web/dist"/* /opt/www/nucur/
+```
+
+这两步之间有空窗期：目录被清空后、新文件没拷完之前，nginx 请求会直接 404，用户能感知到瞬时白屏/资源丢失。构建失败或拷贝中断（磁盘满、cp 被中断）还会让线上长期停留在"半个网站"状态，且没有简单回滚手段。
+
+**推荐做法：版本化目录 + 原子切换软链接**，nginx 的 `root` 指向软链接而非固定目录：
+
+```bash
+BUILD_DIR="/opt/www/releases/nucur-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$BUILD_DIR"
+cp -rf "${WORKSPACE}/nucur-web/dist"/* "$BUILD_DIR/"
+ln -sfn "$BUILD_DIR" /opt/www/nucur-current   # 原子替换软链接
+```
+
+nginx 配置里 `root /opt/www/nucur-current;`。这样切换是原子的（`ln -sfn` 是单个系统调用），出问题也能秒级回滚到上一个 `releases/nucur-*` 目录，旧版本还能保留几份做灰度/回退，不影响给 jenkins 的属主设计。
+
+**2. 确认父目录 `/opt/www` 没被 jenkins 波及**
+
+```bash
+ls -ld /opt/www
+```
+
+`/opt/www` 本身应是 `root:root`（或至少不是 jenkins 可写）。POSIX 语义上，jenkins 拥有 `/opt/www/nucur` 只代表它能任意增删该目录内部文件（`rm -rf /opt/www/nucur/*` 没问题），但**若父目录 `/opt/www` 对 jenkins 也可写**，jenkins 还能 `rm -rf /opt/www/nucur` 删掉整个目录条目重建、或新建/移动 `/opt/www` 下其他项目，波及同台机器上的其他前端项目。只要父目录属主是 root、jenkins 没有父目录写权限，当前隔离粒度就安全——**这一步务必确认，别默认它是对的**。
+
+**3. 多项目共用同一 jenkins 账号（需意识到，不必现在处理）**
+
+如果 `/opt/www` 下每个项目目录都各自 chown 给 `jenkins:jenkins`，那么任何一个项目的 Jenkinsfile 被篡改，都有能力波及所有其他同样归 jenkins 所有的前端目录（同一个系统账户）。这是"单一 CI 账户管理多项目"的固有代价，不是本次调整引入的新问题。未来项目/协作者变多时，可考虑给每个项目用独立部署凭证/独立 Jenkins agent 做进一步隔离。
+
+**4. 目录权限 755 可按需收紧到 750**
+
+这些文件本就要通过 HTTP 公开访问，"其他系统用户能否直接读文件"安全意义不大（内容本就公开），所以 755 不算错。想更严格可：
+
+```bash
+chmod 750 /opt/www/nucur
+usermod -aG jenkins nginx   # 让 nginx 能读，同时收掉 other 权限
+```
+
+这属于锦上添花，非必须项。
+
+**5. 顺带：`npm` 的 install-scripts 拦截提示是好事，别急着"修掉"**
+
+```text
+npm warn install-scripts 1 package had install scripts blocked because they are not covered by allowScripts:
+npm warn install-scripts   esbuild@0.21.5 (postinstall: node install.js)
+```
+
+这是 npm 新版本默认拦截依赖包的 postinstall 脚本——postinstall 是供应链攻击的常见入口（恶意/被劫持的 npm 包通过它在 CI 环境里执行任意代码，直接以 jenkins 身份跑）。这是一层有效防护，不建议为消除警告就无脑 `npm install-scripts approve` 放行所有包，除非确认 esbuild 的这个 postinstall 必要且可信（它通常只是下载对应平台二进制，风险相对低，但仍应评估后再放行）。
+
+#### 三、结论
+
+| 维度 | 结论 |
+| :--- | :--- |
+| 属主设计 | 给 jenkins 精确到**项目粒度**的目录属主（而非整个 `/opt/www`），对纯静态前端合理，无需像后端那样加 root 中转脚本 |
+| 关键修复 | 用**软链接原子切换**替代 `rm -rf + cp`，保证部署原子性与可回滚 |
+| 必要确认 | 父目录 `/opt/www` 必须 `root:root`、jenkins 不可写，否则隔离失效 |
+| 可选加固 | 目录 755→750 + nginx 加入 jenkins 组；保留 npm postinstall 拦截 |
+
+---
+
+
+
+## 8. Docker 容器技术入门与常用命令及 Demo 脚本
 
 ### 问题
 Docker 是什么？它解决了什么问题？如何编写一个简单的 Docker 部署脚本？
@@ -4933,7 +5020,7 @@ chmod +x deploy.sh
 
 
 
-## 8. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型
+## 9. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型
 
 ### 问题
 如何把一个原本"裸机部署"（编译二进制 → mv → systemctl restart）的 Go 后端服务，改造成 Docker 化交付？改造过程中有哪些容易踩的坑？
@@ -5207,7 +5294,7 @@ fi
 
 
 
-## 9. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理
+## 10. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理
 
 ### 问题
 nucur 服务依赖宿主机的一些本地资源：`/opt/nucur/env/env.config`（环境变量配置，含数据库 DSN、配置开关等）、`/opt/nucur/log/`（生成的日志）、`/opt/nucur/uploads/`（用户上传的资源，通过 nginx 暴露路径访问）、`/opt/nucur/bin/nucur`（可执行二进制）。改用 Docker 后这些资源要如何处理？Docker 的价值是不是就是把应用及所有依赖环境全部打进镜像？
