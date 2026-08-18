@@ -29,6 +29,7 @@
 - [4. GitHub 的 Webhook 触发 Jenkins 任务](#4-github-的-webhook-触发-jenkins-任务)
 - [5. Jenkins 与 systemd 的应用自启及端口冲突分析](#5-jenkins-与-systemd-的应用自启及端口冲突分析)
 - [6. Docker 容器技术入门与常用命令及 Demo 脚本](#6-docker-容器技术入门与常用命令及-demo-脚本)
+- [7. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型](#7-nucur-服务-docker-化改造实战从-jenkinsfile-集成cgo-静态编译陷阱到镜像仓库选型)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -4749,6 +4750,280 @@ chmod +x deploy.sh
 ```
 
 > 说明：脚本假设当前目录下已存在 `Dockerfile`。若容器需要读取环境变量或挂载配置文件，可在 `docker run` 中追加 `-e KEY=VALUE`（设置环境变量）或 `-v 宿主机路径:容器路径`（挂载数据卷）。
+
+---
+
+
+
+## 7. Nucur 服务 Docker 化改造实战：从 Jenkinsfile 集成、CGO 静态编译陷阱到镜像仓库选型
+
+### 问题
+如何把一个原本"裸机部署"（编译二进制 → mv → systemctl restart）的 Go 后端服务，改造成 Docker 化交付？改造过程中有哪些容易踩的坑？
+
+### 解答
+
+#### 一、Jenkinsfile 的 Docker 化改造
+
+**1. 问题定位（改造前的裸机部署）**
+
+原 Pipeline 只有"编译二进制 → scp/mv 到宿主机 → systemctl restart"，完全没有 Docker 环节，本质是裸机部署，环境一致性依赖 Jenkins Agent 和生产机保持高度相似：
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('代码更新') {
+            steps {
+                // 显式指定 relativeTargetDir，让代码落在 ${WORKSPACE}/nucur 下
+                // 而不是铺满 workspace 根目录，为并存的其他项目留出空间
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/master']],
+                    extensions: [[
+                        $class: 'RelativeTargetDirectory',
+                        relativeTargetDir: 'nucur'
+                    ]],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:hwanyan/nucur.git',
+                        credentialsId: 'github-ssh-key'
+                    ]]
+                ])
+            }
+        }
+
+        stage('构建') {
+            steps {
+                dir("${WORKSPACE}/nucur/cmd/server") {
+                    sh '''
+                        export PATH=/usr/local/go/bin:$PATH
+                        export GOPROXY=https://goproxy.cn,direct
+                        ./bd.sh nucur
+                    '''
+                }
+            }
+        }
+
+        stage('部署') {
+            steps {
+                sh '''
+                    sudo mv -f "${WORKSPACE}/nucur/cmd/server/nucur" /opt/nucur/bin/
+                    sudo chown user-nucur:user-nucur /opt/nucur/bin/nucur
+                    sudo systemctl restart nucur
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            // 每次构建后清理该 job 的 workspace，避免多仓库产物互相污染、磁盘堆积
+            cleanWs()
+        }
+    }
+}
+```
+
+**2. 改造方案**
+
+在"构建"和"部署"之间插入 **构建镜像** 和 **推送镜像** 两个新阶段，部署阶段改为 `docker pull` + `docker run` 替代原来的二进制搬运 + `systemctl restart`：
+
+```groovy
+pipeline {
+    agent any
+
+    environment {
+        // Harbor 仓库地址与镜像命名，集中管理，避免散落各处
+        HARBOR_REGISTRY = 'harbor.mycompany.com'
+        IMAGE_NAME      = "${HARBOR_REGISTRY}/nucur/nucur"
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"   // 用构建号做版本号，禁止只用 latest
+    }
+
+    stages {
+        stage('代码更新') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/master']],
+                    extensions: [[
+                        $class: 'RelativeTargetDirectory',
+                        relativeTargetDir: 'nucur'
+                    ]],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:hwanyan/nucur.git',
+                        credentialsId: 'github-ssh-key'
+                    ]]
+                ])
+            }
+        }
+
+        stage('构建') {
+            steps {
+                dir("${WORKSPACE}/nucur/cmd/server") {
+                    sh '''
+                        export PATH=/usr/local/go/bin:$PATH
+                        export GOPROXY=https://goproxy.cn,direct
+                        export CGO_ENABLED=0
+                        ./bd.sh nucur
+                    '''
+                }
+            }
+        }
+
+        stage('构建镜像') {
+            steps {
+                dir("${WORKSPACE}/nucur/cmd/server") {
+                    sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('推送镜像') {
+            steps {
+                // 用 Jenkins Credentials 存 Harbor 账号密码，避免明文出现在脚本/日志里
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-cred',
+                    usernameVariable: 'HARBOR_USER',
+                    passwordVariable: 'HARBOR_PASS'
+                )]) {
+                    sh '''
+                        echo "$HARBOR_PASS" | docker login ${HARBOR_REGISTRY} -u "$HARBOR_USER" --password-stdin
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker logout ${HARBOR_REGISTRY}
+                    '''
+                }
+            }
+        }
+
+        stage('部署') {
+            steps {
+                sh '''
+                    docker pull ${IMAGE_NAME}:${IMAGE_TAG}
+
+                    # 存在旧容器则先停止移除，保证幂等，重复执行不报错
+                    docker rm -f nucur || true
+
+                    docker run -d \
+                        --name nucur \
+                        --restart=always \
+                        -p 8080:8080 \
+                        ${IMAGE_NAME}:${IMAGE_TAG}
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+```
+
+**3. 关键实践点**
+
+- 镜像 tag 用 `${BUILD_NUMBER}`，**禁止只用 latest**，保证可追溯、可回滚。
+- 仓库账号密码通过 Jenkins Credentials（`withCredentials`）注入，用 `--password-stdin` 方式登录，避免明文出现在日志/进程列表。
+- Jenkins Agent 本身需要装好 Docker，且运行用户要有权限访问 `docker.sock`。
+
+#### 二、Dockerfile 设计（打包已编译好的二进制）
+
+由于 `bd.sh` 已在 Agent 上完成编译，Dockerfile 只做"打包"，不重复编译，基础镜像选用轻量的 `alpine` + `ca-certificates`/`tzdata`：
+
+```dockerfile
+# 多阶段无需：二进制已在 Jenkins Agent 编译好，这里只负责装进镜像
+FROM alpine:3.19
+
+# 时区 + CA 证书（访问 HTTPS 服务、做 DNS/时间校准时必需）
+RUN apk add --no-cache ca-certificates tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone
+
+# 以非 root 用户运行，降低容器逃逸风险
+RUN addgroup -S nucur && adduser -S nucur -G nucur
+
+WORKDIR /app
+
+# 放入已编译好的二进制（由 bd.sh 产出，要求 CGO_ENABLED=0 静态编译）
+COPY nucur /app/nucur
+
+# 给二进制执行权限
+RUN chmod +x /app/nucur
+
+USER nucur
+
+EXPOSE 8080
+
+# 启动命令
+ENTRYPOINT ["/app/nucur"]
+```
+
+> 关键点：Dockerfile 与 `bd.sh` 位于同一目录（`cmd/server`），`COPY nucur /app/nucur` 拷贝的是构建阶段刚编译出来的静态二进制。若二进制是动态链接的（见第三节），在 alpine 里会因缺少 glibc 而报 `exec ... no such file or directory`。
+
+#### 三、CGO_ENABLED 静态编译陷阱（结合真实 bd.sh）
+
+**1. 根因**
+
+`bd.sh` 里 `GOOS=linux GOARCH=amd64` 若在 Linux amd64 的 Jenkins Agent 上执行，属于"原生编译"而非跨平台编译，Go 默认会把 `CGO_ENABLED` 置为 1。即使代码没写 `import "C"`，只要用了 `net` 包（网络请求/DNS 解析），也会隐式链接 glibc，产出**动态链接二进制**，在 alpine（musl libc）容器里跑不起来（`exec ... no such file or directory`）。
+
+**2. 验证方法**
+
+```bash
+# 判断二进制是静态还是动态链接
+file nucur
+# 输出含 "dynamically linked" 即为动态链接；"statically linked" 才是纯静态
+
+ldd nucur
+# 动态链接会列出 glibc 依赖；静态链接提示 "not a dynamic executable"
+```
+
+**3. 修复方案**
+
+在 `bd.sh` 显式设置 `CGO_ENABLED=0`，并加 `-ldflags="-s -w"` 精简符号表、缩小体积；建议在 Jenkinsfile"构建"阶段加一道自动校验（`ldd` 检测），提前拦截问题，避免流程走到部署才炸。
+
+**4. `bd.sh` 实现真正的静态编译**
+
+```bash
+#!/bin/bash
+
+# 检查是否提供了参数
+if [ -z "$1" ]; then
+    echo "用法: $0 <输出文件名>"
+    exit 1
+fi
+
+# 显式关闭 CGO，避免隐式链接宿主机 glibc（尤其是用到 net 包时）
+export CGO_ENABLED=0
+export GOOS=linux
+export GOARCH=amd64
+
+# -s -w 去掉符号表和调试信息，减小二进制体积，更适合放入镜像
+go build -ldflags="-s -w" -o "$1" main.go
+
+# 检查编译是否成功
+if [ $? -eq 0 ]; then
+    echo "编译成功，输出文件: $1"
+    file "$1"    # 顺手打印一下链接方式，方便肉眼确认是否为纯静态
+else
+    echo "编译失败"
+    exit 1
+fi
+```
+
+#### 四、镜像仓库选型（个人项目场景）
+
+**结论：Harbor 对个人项目偏"重"**——企业级多租户/RBAC/扫描功能用不上，还要额外运维一套服务。
+
+| 方案 | 适用场景 | 说明 |
+| :--- | :--- | :--- |
+| **Docker Hub** | 公开或个人私有仓库（免费额度内） | 最简单，`docker login` 即可用，但国内拉取速度一般 |
+| **GitHub Container Registry (ghcr.io)** | 源码在 GitHub 的项目 | 与 GitHub Actions/仓库天然集成，适合个人开源或私有 |
+| **云厂商个人版镜像仓库** | 国内部署、追求稳定与速度 | 阿里云/腾讯云等个人版免费，国内拉取快，适合国内生产 |
+| **自建 registry:2** | 完全私有、内网环境 | 极轻量，一条命令起服务，但无 Web UI 与权限管控 |
+| **Harbor** | 企业/团队、多租户、镜像扫描 | 功能强但偏重，个人项目通常用不上 |
+
+> 选型建议：个人项目优先 `Docker Hub` 或 `ghcr.io`（海外）／`云厂商个人版`（国内）；只有团队协作、需要 RBAC 与镜像扫描时才上 Harbor。
 
 ---
 
