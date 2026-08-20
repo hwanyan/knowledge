@@ -35,6 +35,7 @@
 - [10. Nucur 服务 Docker 化时宿主机本地资源（配置/日志/上传目录）的挂载处理](#10-nucur-服务-docker-化时宿主机本地资源配置日志上传目录的挂载处理)
 - [11. Jenkins 访问 Docker Daemon 的权限方案与安全权衡](#11-jenkins-访问-docker-daemon-的权限方案与安全权衡)
 - [12. Jenkins 公网暴露收敛与管理入口安全](#12-jenkins-公网暴露收敛与管理入口安全)
+- [13. nginx 接管公网入口，Jenkins 本体完全不直接暴露的实践方案](#13-nginx-接管公网入口jenkins-本体完全不直接暴露的实践方案)
 
 ### 服务器运维相关
 - [1. Linux 命令行提示符解析](#1-linux-命令行提示符解析)
@@ -5585,6 +5586,10 @@ location /github-webhook/ {
 
 风险点：家庭/移动宽带多为动态 IP，换一次 IP 就被拒之门外，需重登控制台改配置，体验不如方案 B 稳定。
 
+**利用 VsCode 的端口转发功能** 落地最简单实际最好用：
+
+在本地使用 VsCode 连接云服务器，在下方 “端口” 选项中点击 “转发端口”，然后输入在服务器上 Jenkins 使用的端口并回车确定。如果成功，可以在 “转发地址” 里看到本地是基于哪个端口连接的的云服务器上的固定端口。这时候直接在本地浏览器中打开 http://localhost:[转发段端口号] 就能访问。这样的方式本质上也是通过 SSH 隧道建立的，不过 VsCode 将这个操作封装在了应用层里。
+
 #### 四、小结
 
 | 维度 | 结论 |
@@ -5594,6 +5599,207 @@ location /github-webhook/ {
 | 最优收敛 | nginx 反代 + 只监听内网 + webhook Secret + 撤掉安全组 8086 |
 | 临时缓解 | 安全组来源改为 GitHub 官方 IP 段 |
 | 管理入口 | 不会失去管理能力，推荐 SSH 隧道（方案 B），Jenkins 自身账号鉴权仍需保留（网络层只是多一道防线，不替代密码） |
+
+---
+
+
+
+## 13. nginx 接管公网入口，Jenkins 本体完全不直接暴露的实践方案
+
+### 问题
+如何落地「nginx 接管公网入口、Jenkins 本体完全不直接暴露」的方案？给出可执行的完整步骤。
+
+### 解答
+
+#### 目标架构
+
+```text
+公网 (443)  →  nginx  →  仅转发 /github-webhook/ 路径  →  127.0.0.1:8086 (Jenkins)
+公网 (8086) →  ❌ 安全组直接关闭，不再对外
+你自己管理  →  SSH 隧道直连 127.0.0.1:8086，不走公网、不走 nginx
+```
+
+---
+
+#### 第一步：让 Jenkins 只监听本机回环地址
+
+Jenkins 默认可能监听 `0.0.0.0:8086`（所有网卡），需改成只监听 `127.0.0.1:8086`。
+
+**systemd 方式安装（包管理器装的常见）：**
+
+```bash
+sudo systemctl edit jenkins
+```
+
+弹出编辑窗口里加：
+
+```ini
+[Service]
+Environment="JENKINS_LISTEN_ADDRESS=127.0.0.1"
+```
+
+**Debian 系 `/etc/default/jenkins`：**
+
+```bash
+sudo vim /etc/default/jenkins
+```
+
+修改类似这行：
+
+```text
+JENKINS_ARGS="--httpListenAddress=127.0.0.1 --httpPort=8086"
+```
+
+改完重启并验证：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart jenkins
+
+sudo ss -tlnp | grep 8086
+# 应该只看到 127.0.0.1:8086，而不是 0.0.0.0:8086
+```
+
+> 这一步是关键防线：即使以后有人手滑把安全组 8086 重新对公网打开，只监听 loopback 意味着外部流量根本连不到 Jenkins 进程本身，多一层保险。
+
+---
+
+#### 第二步：申请 SSL 证书
+
+GitHub webhook 默认要求 HTTPS 且校验证书，需要一个域名指向服务器公网 IP。用 certbot 免费申请 Let's Encrypt 证书：
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d jenkins.yourdomain.com
+```
+
+> 该命令会自动在下面 nginx 配置里补上 `ssl_certificate` 相关配置，并设置好自动续期。
+
+---
+
+#### 第三步：nginx 配置
+
+`/etc/nginx/sites-available/jenkins`：
+
+```nginx
+# /etc/nginx/sites-available/jenkins
+
+server {
+    listen 80;
+    server_name jenkins.yourdomain.com;
+    # certbot 续期校验用，其余全部跳转 https
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name jenkins.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/jenkins.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/jenkins.yourdomain.com/privkey.pem;
+
+    # 只转发 GitHub webhook 需要的路径，其它路径一律不代理（默认返回 404）
+    location /github-webhook/ {
+        proxy_pass http://127.0.0.1:8086/github-webhook/;
+
+        # Jenkins 反代必需的头，缺了会导致回调 URL/跳转异常
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_redirect     http:// https://;
+        proxy_read_timeout 90s;
+    }
+
+    # 没有匹配到的路径（包括管理页 /、登录页 /login 等）全部不代理
+    # nginx 默认返回 404，公网访问不到任何 Jenkins 管理界面
+    location / {
+        return 404;
+    }
+}
+```
+
+启用配置：
+
+```bash
+sudo ln -s /etc/nginx/sites-available/jenkins /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+**为什么 `location /` 直接 `return 404` 而不是配 IP 白名单**：结合"动态 IP 会导致自己被锁在外面"的问题，这里干脆不给管理页开任何公网入口，彻底避免维护 IP 白名单的麻烦。自己管理走第七步的 SSH 隧道，不经过 nginx，不受这条 404 规则影响。
+
+---
+
+#### 第四步：在 Jenkins 里同步系统配置
+
+进管理页（此时还能通过内网/当前 8086 直连临时访问，改完再切换）→ `Manage Jenkins → System` → 把 "Jenkins URL" 改成：
+
+```text
+https://jenkins.yourdomain.com/
+```
+
+否则 Jenkins 生成的一些跳转链接/webhook 回调地址会带着旧的 IP:端口，容易出问题。
+
+---
+
+#### 第五步：更新 GitHub Webhook 地址
+
+进 GitHub 仓库 → `Settings → Webhooks` → 编辑现有 webhook，Payload URL 改为：
+
+```text
+https://jenkins.yourdomain.com/github-webhook/
+```
+
+Content type 选 `application/json`，之前配置的 Secret 保持不变（建议一定配置，用于校验签名）。
+
+>核心点：1、在 GitHub 仓库配置的 Webhook 地址需要与 nginx 里配置的入口规则对应，且 nginx 入口侧不能转发。2、在 Jenkins 里配置的 Jenkins URL + github-webhook/ 组成 GitHub 仓库配置的 Webhook 地址。
+
+---
+
+#### 第六步：调整安全组
+
+| 端口 | 来源 | 操作 |
+| :--- | :--- | :--- |
+| 8086 | `0.0.0.0/0` / `::/0` | 删除（Jenkins 已只监听本机，规则不再需要） |
+| 443 | `0.0.0.0/0` / `::/0` | 保留/新增（对外提供 HTTPS） |
+| 80 | `0.0.0.0/0` / `::/0` | 保留（certbot 续期校验 + http→https 跳转） |
+
+---
+
+#### 第七步：日常管理走 SSH 隧道
+
+```bash
+ssh -L 8080:127.0.0.1:8086 你的用户名@服务器IP
+```
+
+浏览器打开 `http://localhost:8080` 进管理页——这条路径完全不经过 nginx/公网 443，只走 SSH 加密隧道。
+
+---
+
+#### 验证清单
+
+```bash
+# 1. 外部访问 8086 应该被拒绝/超时（安全组已删除规则）
+curl -m 5 http://服务器IP:8086
+
+# 2. 外部访问管理页路径应该 404
+curl -I https://jenkins.yourdomain.com/
+
+# 3. webhook 路径应该能正常转发（GitHub 后台 "Recent Deliveries" 能看到 200）
+#    直接在 GitHub webhook 页面点 "Redeliver" 测试一次
+
+# 4. SSH 隧道方式能正常看到 Jenkins 管理页
+```
+
+> 改造完成后，公网只能看到一个"专门收 GitHub webhook、其余全部 404"的入口，Jenkins 管理界面对公网完全不可见，同时 webhook 自动触发流程和日常管理都不受影响。
 
 ---
 
