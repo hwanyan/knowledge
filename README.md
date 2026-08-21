@@ -69,9 +69,10 @@
 - [2. 为什么 psql 在 /usr/ 下，而 mysql 在 /usr/local/ 下（FHS 与安装方式）](#2-为什么-psql-在--usr--下，而-mysql-在--usr-local--下fhs-与安装方式)
 
 ### 数据库相关
-- [MongoDB 数据库详解](#mongodb-数据库详解)
-- [MongoDB 常用命令速查](#mongodb-常用命令速查)
-- [PostgreSQL 常用命令速查](#postgresql-常用命令速查)
+- [1. MongoDB 数据库详解](#mongodb-数据库详解)
+- [2. MongoDB 常用命令速查](#mongodb-常用命令速查)
+- [3. 安装 MongoDB 后，如果要为一个指定应用 app 创建特定的数据库 appdb 和特定用户 app-account 的步骤](#安装-mongodb-后，如果要为一个指定应用-app-创建特定的数据库-appdb-和特定用户-app-account-的步骤)
+- [4. PostgreSQL 常用命令速查](#postgresql-常用命令速查)
 
 ### Agent相关
 - [1. Agent 和 LLM 大模型的区别是什么？](#1-Agent-和-LLM-大模型的区别是什么？)
@@ -11604,6 +11605,54 @@ MongoDB 是一个开源的、**面向文档**的 NoSQL 数据库，是最流行�
 - 多文档事务有性能开销，尤其在分片集群中
 - 性能高度依赖内存，热数据需能放入内存
 - 生产级分片集群运维复杂度高于单机数据库
+
+---
+
+<a id="安装-mongodb-后，如果要为一个指定应用-app-创建特定的数据库-appdb-和特定用户-app-account-的步骤"></a>
+
+## 安装 MongoDB 后，如果要为一个指定应用 app 创建特定的数据库 appdb 和特定用户 app-account 的步骤
+
+MongoDB 有一个强制顺序：一旦开启了访问控制（auth），任何后续的用户/库操作都必须先有管理员身份认证，所以顺序不能反过来。第一件事是：
+
+在还没开启 auth 之前，先在服务器本地无认证连接 mongosh，创建一个管理员账号（后面开启 auth 后就靠它来管理，包括创建 app-account 这个业务用户）。
+
+```bash
+# 在服务器本机执行（此时 mongod 应该还没开 --auth / security.authorization）
+mongosh "mongodb://127.0.0.1:27017/admin"
+```
+
+进入后创建管理员：
+
+```javascript
+use admin
+db.createUser({
+  user: "mongoAdmin",
+  pwd: passwordPrompt(), // 会交互式输入密码，避免明文留在历史命令里
+  roles: [ { role: "userAdminAnyDatabase", db: "admin" }, "readWriteAnyDatabase" ]
+})
+```
+
+之后（不是第一件事，但按顺序会是）：
+
+- 在 mongod.conf 里加上 security.authorization: enabled，重启 mongod
+- 用 mongoAdmin 认证登录，切到 app-account，创建业务用户（数据库会在首次写入/建集合时自动创建，不用单独 create database）：
+
+```javascript
+use appdb
+db.createUser({
+  user: "app-account",
+  pwd: passwordPrompt(),
+  roles: [ { role: "readWrite", db: "appdb" } ]
+})
+```
+
+- 跑项目自带的初始化脚本建集合+索引（注意把 db 名换成 appdb）:
+
+```bash
+MONGO_DATABASE=appdb mongosh "mongodb://app-account:<password>@127.0.0.1:27017/appdb" scripts/mongo/0001_init.js
+```
+
+- 把 MONGO_URI 改成 mongodb://app-account:<password>@<server>:27017/appdb?authSource=appdb（注意 authSource 要指向 appdb，因为用户是建在这个库下的，不是 admin）
 
 ---
 
